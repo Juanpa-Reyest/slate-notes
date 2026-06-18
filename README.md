@@ -1,41 +1,110 @@
 # Slate
 
-Slate is a local-first Linux Markdown notes launcher prototype built with Tauri 2, Rust, SvelteKit, and TypeScript.
+Slate is a local-first Linux desktop app for fast Markdown note-taking, with
+passphrase-encrypted private notes. Built with Tauri 2, Rust, SvelteKit and
+TypeScript.
 
-## Prototype Scope
+## Features
 
-- Floating launcher-style UI with focused search.
-- In-memory notes behind a Rust application boundary.
-- Create, list, search, update, favorite, archive, and delete notes.
-- Markdown editing and preview.
-- Placeholder metadata for protected notes, colors, and categories.
+- Create, edit, search, favorite, archive and delete Markdown notes
+- Categories, colors and a calm, minimalist dark UI
+- Live Markdown editing and preview
+- Local-first storage in SQLite (no cloud, no account)
+- Protected notes with **real encryption** (Argon2id key derivation +
+  XChaCha20-Poly1305) behind a master-passphrase vault, with inactivity auto-lock
+- Export any note to a `.md` file
 
-SQLite persistence and real encryption are intentionally out of scope for this first foundation.
+## Tech stack
 
-## Quick Start
+| Layer | Tech |
+| --- | --- |
+| Desktop shell | Tauri 2 |
+| Frontend | SvelteKit + TypeScript (static SPA) |
+| Backend | Rust, hexagonal architecture |
+| Storage | SQLite (`rusqlite`, bundled) |
+| Crypto | `argon2` + `chacha20poly1305` |
+
+## Prerequisites
+
+- **Rust** (stable) — https://rustup.rs
+- **Node.js** 18+ and npm
+- **Linux system libraries for Tauri** (Debian/Ubuntu):
+
+  ```bash
+  sudo apt update
+  sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+    libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+  ```
+
+  Other distros: see https://v2.tauri.app/start/prerequisites/
+
+## Run it locally (development)
 
 ```bash
+git clone git@github.com:Juanpa-Reyest/slate-notes.git
+cd slate-notes
 npm install
-npm run check
-. "$HOME/.cargo/env" && cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri dev
 ```
 
-If Linux Tauri system packages are missing, install them outside this project according to your distro policy. Do not replace the scaffold with `create-tauri-app --force`.
+`npm run tauri dev` starts the Vite dev server and launches the desktop window
+with hot-reload. Notes are stored in your OS app-data directory, e.g.
+`~/.local/share/dev.juanpa.slate/notes.sqlite`.
 
-## Project Docs
+## Tests & checks
 
-- `docs/product-requirements.md` defines the product direction and MVP scope.
-- `docs/technical-design.md` defines the layered architecture and future SQLite/encryption path.
+```bash
+npm run check                                    # Frontend type-check (svelte-check)
+npm test                                         # Frontend unit tests (Vitest)
+cargo test --manifest-path src-tauri/Cargo.toml  # Backend unit tests (Rust)
+```
 
-## Current Architecture
+## Build a release (package the app)
 
-| Area | Current prototype |
-| --- | --- |
-| Commands | Thin Tauri handlers in `src-tauri/src/commands/`. |
-| Application | Notes use cases in `src-tauri/src/app/`. |
-| Domain | Note model and validation in `src-tauri/src/domain/`. |
-| Ports | Repository abstraction in `src-tauri/src/ports/`. |
-| Infrastructure | In-memory adapter in `src-tauri/src/infra/`. |
-| State | Seeded app state in `src-tauri/src/state/`. |
-| Frontend | Launcher UI in `src/routes/+page.svelte` and typed Tauri client in `src/lib/tauri-client/`. |
+```bash
+npm run tauri build
+```
+
+Artifacts land in `src-tauri/target/release/bundle/`:
+
+- `deb/Slate_<version>_amd64.deb` — Debian/Ubuntu installer
+- `rpm/Slate-<version>-1.x86_64.rpm` — Fedora/RHEL installer
+- `appimage/Slate_<version>_amd64.AppImage` — portable single file
+  (the first build fetches AppImage tooling, so it needs internet access)
+
+Install the `.deb` on your machine:
+
+```bash
+sudo apt install ./src-tauri/target/release/bundle/deb/Slate_0.1.0_amd64.deb
+```
+
+## Distribution roadmap
+
+- **Direct download**: publish the `.deb` / `.rpm` / `.AppImage` on GitHub Releases.
+- **Ubuntu store / sandboxed**: package as **Snap** or **Flatpak** (both supported
+  by Tauri) and publish to the Snap Store / Flathub.
+- App data and logs follow Linux user-directory conventions; no telemetry.
+
+## Architecture (hexagonal)
+
+| Layer | Path | Responsibility |
+| --- | --- | --- |
+| Domain | `src-tauri/src/domain/` | Note + encryption rules; no framework knowledge |
+| Application | `src-tauri/src/app/` | Use cases: notes, vault, secure-notes coordinator |
+| Ports | `src-tauri/src/ports/` | Repository / cipher / clock contracts |
+| Infrastructure | `src-tauri/src/infra/` | SQLite repositories, XChaCha20 cipher, system clock |
+| Commands | `src-tauri/src/commands/` | Thin Tauri IPC handlers |
+| Frontend | `src/routes/+page.svelte`, `src/lib/tauri-client/` | UI + typed client |
+
+The business rules are testable without launching the UI: Tauri commands call
+application use cases, SQLite sits behind repository traits, and encryption is
+encapsulated behind a `Cipher` port.
+
+## Project docs
+
+- `docs/product-requirements.md` — product direction and MVP scope
+- `docs/technical-design.md` — layered architecture and crypto path
+
+## License
+
+MIT
