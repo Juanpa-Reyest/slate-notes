@@ -737,41 +737,6 @@
 </main>
 
 <style>
-  :global(*) {
-    box-sizing: border-box;
-  }
-
-  :global(html),
-  :global(body) {
-    width: 100%;
-    min-height: 100%;
-  }
-
-  :global(body) {
-    margin: 0;
-    min-width: 320px;
-    --bg: #161719;
-    --bg-raised: #1c1d21;
-    --surface-hover: rgba(255, 255, 255, 0.035);
-    --surface-active: rgba(255, 255, 255, 0.06);
-    --btn: #282b36;
-    --btn-hover: #353b4e;
-    --line: rgba(255, 255, 255, 0.07);
-    --line-strong: rgba(255, 255, 255, 0.11);
-    --text: #d6d7da;
-    --text-2: #9a9ca2;
-    --text-3: #6f7178;
-    --accent: #8b9bd4;
-    --accent-bg: rgba(139, 155, 212, 0.12);
-    --accent-line: rgba(139, 155, 212, 0.32);
-    --danger: #d98a8a;
-    --danger-bg: rgba(217, 138, 138, 0.1);
-    color: var(--text);
-    background: var(--bg);
-    font-family:
-      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  }
-
   button,
   input,
   textarea {
