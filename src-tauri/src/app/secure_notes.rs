@@ -142,6 +142,24 @@ where
         Ok(self.notes.delete_note(id)?)
     }
 
+    /// Build a Markdown document for a note, revealing protected content when the
+    /// vault is unlocked (and failing if it is locked). Returns a suggested
+    /// filename and the document body.
+    pub fn export_markdown(&mut self, id: &str) -> Result<(String, String), SecureNotesError> {
+        let note = self.notes.get_note(id)?;
+        let content = if note.is_protected {
+            self.vault.reveal(&note.content)?
+        } else {
+            note.content.clone()
+        };
+
+        let title = note.title.trim();
+        let title = if title.is_empty() { "untitled" } else { title };
+        let document = format!("# {title}\n\n{content}\n");
+        let filename = format!("{}.md", slugify(title));
+        Ok((filename, document))
+    }
+
     /// Replace a protected note's stored (sealed) content with plaintext when the
     /// vault is unlocked, or blank it when locked, before handing it to the UI.
     fn present(&mut self, mut note: Note) -> Note {
@@ -149,6 +167,20 @@ where
             note.content = self.vault.reveal(&note.content).unwrap_or_default();
         }
         note
+    }
+}
+
+/// Turn a note title into a safe, lowercase, dash-separated filename stem.
+fn slugify(value: &str) -> String {
+    let parts: Vec<&str> = value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        "untitled".to_string()
+    } else {
+        parts.join("-").to_ascii_lowercase()
     }
 }
 
@@ -248,6 +280,42 @@ mod tests {
 
         assert!(matches!(
             app.protect_note(&note.id),
+            Err(SecureNotesError::Vault(VaultError::Locked))
+        ));
+    }
+
+    #[test]
+    fn export_markdown_builds_document_and_filename() {
+        let mut app = secure();
+        let note = app.create_note(input("My Great Note", "body text")).unwrap();
+
+        let (filename, document) = app.export_markdown(&note.id).unwrap();
+
+        assert_eq!(filename, "my-great-note.md");
+        assert!(document.starts_with("# My Great Note\n\nbody text"));
+    }
+
+    #[test]
+    fn export_markdown_reveals_protected_content_when_unlocked() {
+        let mut app = secure();
+        app.create_vault("master-pass").unwrap();
+        let note = app.create_note(input("Secret", "classified intel")).unwrap();
+        app.protect_note(&note.id).unwrap();
+
+        let (_, document) = app.export_markdown(&note.id).unwrap();
+        assert!(document.contains("classified intel"));
+    }
+
+    #[test]
+    fn export_markdown_fails_for_locked_protected_note() {
+        let mut app = secure();
+        app.create_vault("master-pass").unwrap();
+        let note = app.create_note(input("Secret", "classified intel")).unwrap();
+        app.protect_note(&note.id).unwrap();
+        app.lock_vault();
+
+        assert!(matches!(
+            app.export_markdown(&note.id),
             Err(SecureNotesError::Vault(VaultError::Locked))
         ));
     }

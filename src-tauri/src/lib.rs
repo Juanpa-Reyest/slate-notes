@@ -27,6 +27,7 @@ pub fn run() {
             commands::notes::toggle_favorite,
             commands::notes::archive_note,
             commands::notes::delete_note,
+            commands::notes::export_note,
             commands::vault::vault_status,
             commands::vault::create_vault,
             commands::vault::unlock_vault,

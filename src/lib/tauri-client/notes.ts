@@ -289,3 +289,31 @@ export function unprotectNote(id: string) {
 
   return invoke<Note>("unprotect_note", { input: { id } });
 }
+
+export function exportNote(id: string) {
+  if (!isTauriRuntime()) {
+    const note = previewNotes.find((item) => item.id === id);
+    if (!note) return Promise.reject(new Error("Note not found"));
+    if (note.isProtected && !previewVault.unlocked) {
+      return Promise.reject(new Error("The vault is locked."));
+    }
+
+    const content = note.isProtected ? previewSecrets[id] ?? note.content : note.content;
+    const title = note.title.trim() || "untitled";
+    const document_ = `# ${title}\n\n${content}\n`;
+    const stem =
+      title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "untitled";
+
+    const blob = new Blob([document_], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${stem}.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+
+    return Promise.resolve("your browser downloads");
+  }
+
+  return invoke<string>("export_note", { input: { id } });
+}

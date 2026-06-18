@@ -15,6 +15,7 @@
     lockVault,
     protectNote,
     unprotectNote,
+    exportNote,
     type Note,
     type VaultStatus,
   } from "$lib/tauri-client/notes";
@@ -70,6 +71,7 @@
   let passphrase = $state("");
   let passphraseConfirm = $state("");
   let vaultError = $state("");
+  let noticeMessage = $state("");
 
   let sourceNotes = $derived(notes);
   let categoryItems = $derived(buildCategoryItems(sourceNotes));
@@ -328,6 +330,18 @@
     });
   }
 
+  async function handleExport() {
+    if (!selectedNote) return;
+    noticeMessage = "";
+    errorMessage = "";
+    try {
+      const where = await exportNote(selectedNote.id);
+      noticeMessage = `Exported to ${where}`;
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async function handleShellKeydown(event: KeyboardEvent) {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
@@ -429,6 +443,10 @@
     {:else if name === "edit"}
       <path d="M4 20h4l9.5-9.5-4-4L4 16z" />
       <path d="M13.5 6.5l4 4" />
+    {:else if name === "download"}
+      <path d="M12 4v10" />
+      <path d="M8 11l4 4 4-4" />
+      <path d="M5 19h14" />
     {/if}
   </svg>
 {/snippet}
@@ -479,6 +497,10 @@
 
       {#if errorMessage}
         <p class="error" role="alert">{errorMessage}</p>
+      {/if}
+
+      {#if noticeMessage}
+        <p class="notice" role="status">{noticeMessage}</p>
       {/if}
 
       <nav class="category-nav" aria-label="Categories">
@@ -545,6 +567,7 @@
             <button type="button" onclick={handleFavorite}>{@render btnIcon("star")}<span>{selectedNote.isFavorite ? "Starred" : "Star"}</span></button>
             <button type="button" onclick={handleArchive}>{@render btnIcon("archive")}<span>{selectedNote.isArchived ? "Restore" : "Archive"}</span></button>
             <button type="button" onclick={handleToggleProtection}>{@render btnIcon(selectedNote.isProtected ? "unlock" : "lock")}<span>{selectedNote.isProtected ? "Unprotect" : "Protect"}</span></button>
+            <button type="button" onclick={handleExport}>{@render btnIcon("download")}<span>Export</span></button>
             <button class="danger" type="button" onclick={handleDelete}>{@render btnIcon("trash")}<span>Delete</span></button>
             <button class="save" type="button" onclick={handleSave}>{@render btnIcon("check")}<span>{isSaving ? "Saving" : "Save"}</span></button>
           </div>
@@ -1488,6 +1511,17 @@
     border-radius: 8px;
     color: var(--danger);
     background: var(--danger-bg);
+  }
+
+  .notice {
+    margin: 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(111, 174, 142, 0.25);
+    border-radius: 8px;
+    color: #7fbf9a;
+    background: rgba(111, 174, 142, 0.12);
+    font-size: 0.82rem;
+    word-break: break-all;
   }
 
   .empty-list,

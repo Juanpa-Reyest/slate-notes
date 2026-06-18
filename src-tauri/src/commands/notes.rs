@@ -1,7 +1,7 @@
 use crate::domain::note::{CreateNoteInput, Note, UpdateNoteInput};
 use crate::state::AppState;
 use serde::Deserialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,4 +83,29 @@ pub fn delete_note(input: NoteIdInput, state: State<'_, AppState>) -> Result<(),
         .map_err(|_| "Notes state is unavailable.".to_string())?
         .delete_note(&input.id)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn export_note(
+    input: NoteIdInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let (filename, content) = state
+        .notes
+        .lock()
+        .map_err(|_| "Notes state is unavailable.".to_string())?
+        .export_markdown(&input.id)
+        .map_err(|error| error.to_string())?;
+
+    let directory = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().home_dir())
+        .map_err(|error| error.to_string())?;
+    let path = directory.join(filename);
+
+    std::fs::write(&path, content).map_err(|error| error.to_string())?;
+
+    Ok(path.to_string_lossy().into_owned())
 }
