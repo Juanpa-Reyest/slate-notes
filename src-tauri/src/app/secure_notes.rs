@@ -319,4 +319,28 @@ mod tests {
             Err(SecureNotesError::Vault(VaultError::Locked))
         ));
     }
+
+    #[test]
+    fn search_matches_metadata_and_excludes_others() {
+        let mut app = secure();
+        app.create_note(input("Rust backend", "domain tests")).unwrap();
+        app.create_note(input("Shopping", "buy milk")).unwrap();
+
+        let results = app.search_notes("backend").unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rust backend");
+    }
+
+    #[test]
+    fn search_does_not_match_locked_protected_content() {
+        let mut app = secure();
+        app.create_vault("master-pass").unwrap();
+        let note = app.create_note(input("Journal", "uniquesecretword")).unwrap();
+        app.protect_note(&note.id).unwrap();
+        app.lock_vault();
+
+        // Locked: content is blanked, so the secret word must never be searchable.
+        assert!(app.search_notes("uniquesecretword").unwrap().is_empty());
+    }
 }

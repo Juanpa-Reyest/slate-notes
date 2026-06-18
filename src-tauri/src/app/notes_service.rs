@@ -63,15 +63,6 @@ impl<R: NoteRepository> NotesService<R> {
         self.repository.list()
     }
 
-    pub fn search_notes(&self, query: &str) -> Result<Vec<Note>, NoteError> {
-        Ok(self
-            .repository
-            .list()?
-            .into_iter()
-            .filter(|note| note.matches_query(query))
-            .collect())
-    }
-
     pub fn update_note(&mut self, input: UpdateNoteInput) -> Result<Note, NoteError> {
         let mut note = self
             .repository
@@ -209,28 +200,6 @@ mod tests {
             service.archive_note("missing"),
             Err(NoteError::NotFound)
         ));
-    }
-
-    #[test]
-    fn search_returns_matches_and_excludes_non_matches() {
-        let mut service = service();
-        service
-            .create_note(create_input(
-                "Rust backend",
-                "Domain tests",
-                Some("Engineering"),
-            ))
-            .expect("note should be valid");
-        service
-            .create_note(create_input("Shopping", "Buy milk", Some("Personal")))
-            .expect("note should be valid");
-
-        let results = service
-            .search_notes("backend")
-            .expect("search should succeed");
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Rust backend");
     }
 
     #[test]
