@@ -1,6 +1,8 @@
 name: Release
 
 # This robot wakes up when you push a version tag like "v0.1.0".
+# It builds the app on three operating systems at once and attaches every
+# installer to a single draft Release.
 on:
   push:
     tags:
@@ -10,7 +12,19 @@ jobs:
   build-and-release:
     permissions:
       contents: write # allow the robot to create the GitHub Release
-    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04 # Linux  -> .deb / .rpm / .AppImage
+            args: ""
+          - platform: windows-latest # Windows -> .msi / .exe
+            args: ""
+          - platform: macos-latest # macOS -> .dmg (Intel + Apple Silicon)
+            args: "--target universal-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Checkout the code
@@ -23,8 +37,12 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS needs both CPU targets to build a universal binary.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Install Linux system dependencies (Tauri)
+        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -46,6 +64,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Slate ${{ github.ref_name }}"
-          releaseBody: "Download the installer for your system below (.deb, .rpm or .AppImage)."
+          releaseBody: "Download the installer for your operating system below (Linux .deb/.rpm/.AppImage, Windows .msi/.exe, macOS .dmg)."
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.args }}
