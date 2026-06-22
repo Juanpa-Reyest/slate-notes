@@ -74,6 +74,9 @@
   let passphraseConfirm = $state("");
   let vaultError = $state("");
   let noticeMessage = $state("");
+  // Remembers a protect/unprotect the user asked for while the vault was locked,
+  // so it completes automatically once they unlock instead of silently dropping.
+  let pendingProtect = $state<{ id: string; protect: boolean } | null>(null);
 
   let sourceNotes = $derived(notes);
   let categoryItems = $derived(buildCategoryItems(sourceNotes));
@@ -324,6 +327,8 @@
     passphrase = "";
     passphraseConfirm = "";
     vaultError = "";
+    // Cancelling the dialog abandons any protect intent that was waiting on it.
+    pendingProtect = null;
   }
 
   async function submitVault() {
@@ -342,8 +347,13 @@
         vaultMode === "create"
           ? await createVault(passphrase)
           : await unlockVault(passphrase);
+      const intent = pendingProtect;
       closeVaultDialog();
       await refresh();
+      // Finish what the user originally asked for before the unlock detour.
+      if (intent) {
+        await applyProtection(intent.id, intent.protect);
+      }
     } catch (error) {
       vaultError = error instanceof Error ? error.message : String(error);
     }
@@ -364,18 +374,26 @@
   async function handleToggleProtection() {
     if (!selectedNote) return;
     const note = selectedNote;
+    const protect = !note.isProtected;
 
+    // Both protecting (encrypt) and unprotecting (decrypt) need the key, so an
+    // unlocked vault is required. If it is locked, remember the intent and let
+    // the vault dialog finish the job after a successful unlock.
     if (!vault.unlocked) {
+      pendingProtect = { id: note.id, protect };
       openVaultDialog();
       return;
     }
 
+    await applyProtection(note.id, protect);
+  }
+
+  async function applyProtection(id: string, protect: boolean) {
     await run(async () => {
       await autosave.flush();
-      const updated = note.isProtected
-        ? await unprotectNote(note.id)
-        : await protectNote(note.id);
+      const updated = protect ? await protectNote(id) : await unprotectNote(id);
       await refresh(updated.id);
+      noticeMessage = protect ? "Note protected 🔒" : "Note unprotected";
     });
   }
 
