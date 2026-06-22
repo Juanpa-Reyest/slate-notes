@@ -11,12 +11,29 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            // Action + error logs to a per-OS file (and stdout in dev). Never
+            // logs note content or passphrases — only actions, ids and errors.
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("slate".to_string()),
+                    },
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("notes.sqlite");
+            log::info!("Slate starting; database at {}", db_path.display());
             app.manage(AppState::sqlite(db_path)?);
+            log::info!("application state ready");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
