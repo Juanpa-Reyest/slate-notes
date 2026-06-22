@@ -19,6 +19,7 @@
     type Note,
     type VaultStatus,
   } from "$lib/tauri-client/notes";
+  import { createAutosave, type SaveStatus } from "$lib/autosave";
 
   type CategoryNavItem = {
     id: string;
@@ -59,7 +60,8 @@
   let selectedCategory = $state("all");
   let searchQuery = $state("");
   let errorMessage = $state("");
-  let isSaving = $state(false);
+  let saveStatus = $state<SaveStatus>("idle");
+  let lastSavedAt = $state("");
   let isMarkdownEditing = $state(false);
   let isCategoryMenuOpen = $state(false);
   let isColorMenuOpen = $state(false);
@@ -77,6 +79,8 @@
   let categoryItems = $derived(buildCategoryItems(sourceNotes));
   let visibleNotes = $derived(filterNotes(sourceNotes, selectedCategory, searchQuery));
   let previewHtml = $derived(selectedNote ? marked.parse(selectedNote.content) : "");
+  let isNoteLocked = $derived(!!selectedNote?.isProtected && !vault.unlocked);
+  let saveLabel = $derived(formatSaveLabel(saveStatus, lastSavedAt));
 
   onMount(async () => {
     notes = await listNotes();
@@ -201,6 +205,7 @@
 
   async function handleCreate() {
     await run(async () => {
+      await autosave.flush();
       const category = selectedCategory.startsWith("category:")
         ? selectedCategory.replace("category:", "")
         : "Inbox";
@@ -217,30 +222,70 @@
     });
   }
 
-  async function handleSave() {
-    if (!selectedNote) return;
+  async function persistSelectedNote() {
     const note = selectedNote;
+    if (!note) return;
+    // Never overwrite a protected note's encrypted content while locked.
+    if (note.isProtected && !vault.unlocked) return;
 
-    isSaving = true;
-    await run(async () => {
-      const saved = await updateNote({
-        id: note.id,
-        title: note.title,
-        content: note.content,
-        category: note.category,
-        tags: note.tags,
-        color: note.color,
-      });
-      await refresh(saved.id);
-      isMarkdownEditing = false;
+    await updateNote({
+      id: note.id,
+      title: note.title,
+      content: note.content,
+      category: note.category,
+      tags: note.tags,
+      color: note.color,
     });
-    isSaving = false;
+  }
+
+  const autosave = createAutosave(persistSelectedNote, {
+    delayMs: 800,
+    onStatus: (status) => {
+      saveStatus = status;
+      if (status === "saved") {
+        lastSavedAt = formatClock();
+        errorMessage = "";
+      }
+      if (status === "error") errorMessage = "Could not save the note.";
+    },
+  });
+
+  // Mark the current note dirty so autosave persists it after a short pause.
+  function scheduleAutosave() {
+    if (!selectedNote) return;
+    if (selectedNote.isProtected && !vault.unlocked) return;
+    autosave.schedule();
+  }
+
+  // Explicit save (button / Ctrl+S) just flushes the pending autosave.
+  async function handleSave() {
+    await run(() => autosave.flush());
+  }
+
+  function formatClock() {
+    return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function formatSaveLabel(status: SaveStatus, savedAt: string): string {
+    switch (status) {
+      case "saving":
+        return "Saving…";
+      case "pending":
+        return "Unsaved changes";
+      case "error":
+        return "Save failed";
+      case "saved":
+        return savedAt ? `Saved ${savedAt}` : "Saved";
+      default:
+        return "Saved";
+    }
   }
 
   async function handleFavorite() {
     if (!selectedNote) return;
     const note = selectedNote;
     await run(async () => {
+      await autosave.flush();
       const updated = await toggleFavorite(note.id);
       await refresh(updated.id);
     });
@@ -250,6 +295,7 @@
     if (!selectedNote) return;
     const note = selectedNote;
     await run(async () => {
+      await autosave.flush();
       const updated = await archiveNote(note.id);
       await refresh(updated.id);
     });
@@ -259,6 +305,7 @@
     if (!selectedNote) return;
     const deletedId = selectedNote.id;
     await run(async () => {
+      autosave.cancel();
       await deleteNote(deletedId);
       await refresh();
     });
@@ -305,6 +352,7 @@
   async function handleVaultButton() {
     if (vault.unlocked) {
       await run(async () => {
+        await autosave.flush();
         vault = await lockVault();
         await refresh();
       });
@@ -323,6 +371,7 @@
     }
 
     await run(async () => {
+      await autosave.flush();
       const updated = note.isProtected
         ? await unprotectNote(note.id)
         : await protectNote(note.id);
@@ -359,7 +408,8 @@
     }
   }
 
-  function selectCategory(categoryId: string) {
+  async function selectCategory(categoryId: string) {
+    await autosave.flush();
     selectedCategory = categoryId;
     const nextVisibleNotes = filterNotes(notes, categoryId, searchQuery);
     selectedNote = nextVisibleNotes[0] ?? null;
@@ -368,7 +418,9 @@
     isColorMenuOpen = false;
   }
 
-  function selectNote(note: Note) {
+  async function selectNote(note: Note) {
+    if (note.id === selectedNote?.id) return;
+    await autosave.flush();
     selectedNote = note;
     isMarkdownEditing = false;
     isCategoryMenuOpen = false;
@@ -381,6 +433,7 @@
     selectedNote.category = category;
     selectedCategory = categoryId(category);
     isCategoryMenuOpen = false;
+    scheduleAutosave();
   }
 
   function setNoteColor(color: string) {
@@ -388,6 +441,7 @@
 
     selectedNote.color = color;
     isColorMenuOpen = false;
+    scheduleAutosave();
   }
 
   function toggleCategoryMenu() {
@@ -416,7 +470,7 @@
   <title>Slate</title>
 </svelte:head>
 
-<svelte:window onkeydown={handleShellKeydown} />
+<svelte:window onkeydown={handleShellKeydown} onblur={() => autosave.flush()} />
 
 {#snippet btnIcon(name: string)}
   <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -560,7 +614,14 @@
         <header class="content-header">
           <div class="title-stack">
             <label for="note-title">Note title</label>
-            <input id="note-title" bind:value={selectedNote.title} aria-label="Note title" />
+            <input
+              id="note-title"
+              bind:value={selectedNote.title}
+              oninput={scheduleAutosave}
+              onblur={() => autosave.flush()}
+              disabled={isNoteLocked}
+              aria-label="Note title"
+            />
           </div>
 
           <div class="actions" aria-label="Note actions">
@@ -569,7 +630,7 @@
             <button type="button" onclick={handleToggleProtection}>{@render btnIcon(selectedNote.isProtected ? "unlock" : "lock")}<span>{selectedNote.isProtected ? "Unprotect" : "Protect"}</span></button>
             <button type="button" onclick={handleExport}>{@render btnIcon("download")}<span>Export</span></button>
             <button class="danger" type="button" onclick={handleDelete}>{@render btnIcon("trash")}<span>Delete</span></button>
-            <button class="save" type="button" onclick={handleSave}>{@render btnIcon("check")}<span>{isSaving ? "Saving" : "Save"}</span></button>
+            <button class={["save", "save-status", saveStatus]} type="button" onclick={handleSave} title="Save now (Ctrl+S)">{@render btnIcon("check")}<span>{saveLabel}</span></button>
           </div>
         </header>
 
@@ -645,8 +706,12 @@
             </div>
           </div>
 
-          <span class={["status-chip", selectedNote.isProtected ? "locked" : "open"]}>
-            {selectedNote.isProtected ? "Protected placeholder" : "Open note"}
+          <span class={["status-chip", isNoteLocked ? "locked" : "open"]}>
+            {#if selectedNote.isProtected}
+              {isNoteLocked ? "🔒 Locked" : "🔓 Protected"}
+            {:else}
+              Open note
+            {/if}
           </span>
 
           <span class="status-chip">{colorLabel(selectedNote.color)}</span>
@@ -667,7 +732,13 @@
                 <span>Markdown edit</span>
                 <kbd>Ctrl S</kbd>
               </div>
-              <textarea bind:value={selectedNote.content} aria-label="Markdown editor" spellcheck="false"></textarea>
+              <textarea
+                bind:value={selectedNote.content}
+                oninput={scheduleAutosave}
+                onblur={() => autosave.flush()}
+                aria-label="Markdown editor"
+                spellcheck="false"
+              ></textarea>
             </section>
           {/if}
 
@@ -1222,6 +1293,32 @@
     border-color: var(--accent-line);
     color: var(--accent);
     background: var(--accent-bg);
+    min-width: 124px;
+    justify-content: center;
+  }
+
+  /* Autosave status cues so the user can tell saved from unsaved at a glance. */
+  .actions .save-status.pending {
+    color: var(--text-2);
+    border-color: var(--line-strong);
+    background: var(--btn);
+  }
+
+  .actions .save-status.saving {
+    color: var(--text-3);
+    border-color: var(--line-strong);
+    background: var(--btn);
+  }
+
+  .actions .save-status.error {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: var(--danger-bg);
+  }
+
+  .title-stack input:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   .meta-strip {
