@@ -360,6 +360,14 @@
     }
   }
 
+  // Enter inside the passphrase fields submits the vault dialog (same as clicking the button).
+  function handlePassphraseKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submitVault();
+    }
+  }
+
   async function handleVaultButton() {
     if (vault.unlocked) {
       await run(async () => {
@@ -824,11 +832,11 @@
 
         <label for="vault-pass">Passphrase</label>
         <!-- svelte-ignore a11y_autofocus -->
-        <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} />
+        <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} onkeydown={handlePassphraseKeydown} />
 
         {#if vaultMode === "create"}
           <label for="vault-confirm">Confirm passphrase</label>
-          <input id="vault-confirm" type="password" autocomplete="off" bind:value={passphraseConfirm} />
+          <input id="vault-confirm" type="password" autocomplete="off" bind:value={passphraseConfirm} onkeydown={handlePassphraseKeydown} />
         {/if}
 
         {#if vaultError}
