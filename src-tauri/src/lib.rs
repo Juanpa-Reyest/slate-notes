@@ -47,8 +47,8 @@ pub fn run() {
             commands::notes::export_note,
             commands::vault::vault_status,
             commands::vault::create_vault,
-            commands::vault::unlock_vault,
-            commands::vault::lock_vault,
+            commands::vault::reveal_note,
+            commands::vault::clear_active,
             commands::vault::protect_note,
             commands::vault::unprotect_note,
         ])

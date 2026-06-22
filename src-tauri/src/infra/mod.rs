@@ -6,4 +6,3 @@ pub mod xchacha_cipher;
 #[cfg(test)]
 pub mod memory_vault_repository;
 pub mod sqlite_vault_repository;
-pub mod system_clock;

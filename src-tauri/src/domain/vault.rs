@@ -2,8 +2,10 @@
 //!
 //! A single vault guards all protected notes with one master passphrase. The
 //! passphrase is never stored: we keep a salt plus a "sentinel" — a known
-//! constant encrypted under the derived key — so unlocking can verify the
-//! passphrase by decrypting the sentinel and comparing it.
+//! constant encrypted under the derived key — so a passphrase can be verified
+//! by decrypting the sentinel and comparing it. There is no persistent unlocked
+//! session: each protected operation re-derives its key from the passphrase
+//! supplied at that moment (strict per-note authentication).
 
 use serde::Serialize;
 
@@ -21,11 +23,13 @@ pub struct VaultRecord {
     pub sentinel: Sealed,
 }
 
-/// Whether a vault exists yet, and whether it is currently unlocked.
+/// Whether a vault exists yet, and whether a protected note is currently open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultStatus {
     pub initialized: bool,
+    /// True while a protected note is open and its transient key is held
+    /// (under per-note auth there is no global unlocked session).
     pub unlocked: bool,
 }
 
@@ -35,7 +39,7 @@ pub enum VaultError {
     AlreadyExists,
     /// No vault has been created yet.
     NotInitialized,
-    /// The vault is locked; unlock it first.
+    /// The note is not the currently open protected note; reveal it first.
     Locked,
     /// The supplied passphrase did not unlock the vault.
     InvalidPassphrase,

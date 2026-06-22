@@ -1,71 +1,39 @@
-//! The vault use cases: create, unlock, lock, and (while unlocked) seal/open
-//! protected content. The derived key lives only inside the live session and is
-//! cleared on lock or after an inactivity timeout (auto-lock).
+//! The vault use cases under STRICT PER-NOTE authentication.
+//!
+//! There is NO persistent unlocked session and NO auto-lock timer. Each
+//! protected operation derives its key from a passphrase supplied at that
+//! moment. The service is stateless: it never holds a derived key. Callers that
+//! need to reuse a key transiently (e.g. autosave of the currently-open note)
+//! own the `DerivedKey` returned by `create`/`verify_key` and pass it back into
+//! `seal_with`/`open_with`.
 
 use crate::domain::encryption::{DerivedKey, Sealed, PAYLOAD_VERSION};
-use crate::domain::vault::{VaultError, VaultRecord, VaultStatus, VAULT_SENTINEL};
+use crate::domain::vault::{VaultError, VaultRecord, VAULT_SENTINEL};
 use crate::ports::cipher::Cipher;
-use crate::ports::clock::Clock;
 use crate::ports::vault_repository::VaultRepository;
 
-/// A live unlocked session: the derived key plus the last time it was used.
-struct Session {
-    key: DerivedKey,
-    last_activity: u64,
-}
-
-pub struct VaultService<R, C, K> {
+pub struct VaultService<R, C> {
     repository: R,
     cipher: C,
-    clock: K,
-    auto_lock_secs: u64,
-    session: Option<Session>,
 }
 
-impl<R, C, K> VaultService<R, C, K>
+impl<R, C> VaultService<R, C>
 where
     R: VaultRepository,
     C: Cipher,
-    K: Clock,
 {
-    pub fn new(repository: R, cipher: C, clock: K, auto_lock_secs: u64) -> Self {
-        Self {
-            repository,
-            cipher,
-            clock,
-            auto_lock_secs,
-            session: None,
-        }
+    pub fn new(repository: R, cipher: C) -> Self {
+        Self { repository, cipher }
     }
 
-    /// Clear the session if it has been idle past the auto-lock window.
-    fn enforce_auto_lock(&mut self) {
-        if let Some(session) = &self.session {
-            let idle = self.clock.now_secs().saturating_sub(session.last_activity);
-            if idle >= self.auto_lock_secs {
-                self.session = None;
-            }
-        }
+    /// Whether a vault record exists yet.
+    pub fn is_initialized(&self) -> Result<bool, VaultError> {
+        Ok(self.repository.load()?.is_some())
     }
 
-    fn start_session(&mut self, key: DerivedKey) {
-        self.session = Some(Session {
-            key,
-            last_activity: self.clock.now_secs(),
-        });
-    }
-
-    pub fn status(&mut self) -> Result<VaultStatus, VaultError> {
-        self.enforce_auto_lock();
-        let initialized = self.repository.load()?.is_some();
-        Ok(VaultStatus {
-            initialized,
-            unlocked: self.session.is_some(),
-        })
-    }
-
-    /// Create the vault for the first time and leave it unlocked.
-    pub fn create(&mut self, passphrase: &str) -> Result<(), VaultError> {
+    /// Create the vault for the first time. Returns the derived key to the
+    /// caller; the service keeps no session.
+    pub fn create(&mut self, passphrase: &str) -> Result<DerivedKey, VaultError> {
         if self.repository.load()?.is_some() {
             return Err(VaultError::AlreadyExists);
         }
@@ -80,12 +48,12 @@ where
             sentinel,
         })?;
 
-        self.start_session(key);
-        Ok(())
+        Ok(key)
     }
 
-    /// Unlock an existing vault by verifying the passphrase against the sentinel.
-    pub fn unlock(&mut self, passphrase: &str) -> Result<(), VaultError> {
+    /// Verify a passphrase against the stored sentinel and return the derived
+    /// key. `NotInitialized` if no vault exists; `InvalidPassphrase` on mismatch.
+    pub fn verify_key(&self, passphrase: &str) -> Result<DerivedKey, VaultError> {
         let record = self.repository.load()?.ok_or(VaultError::NotInitialized)?;
 
         let key = self.cipher.derive_key(passphrase, &record.salt)?;
@@ -98,48 +66,23 @@ where
             return Err(VaultError::InvalidPassphrase);
         }
 
-        self.start_session(key);
-        Ok(())
+        Ok(key)
     }
 
-    /// Lock the vault, wiping the derived key from memory.
-    pub fn lock(&mut self) {
-        self.session = None;
-    }
-
-    /// Encrypt protected content. Requires an unlocked vault.
-    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, VaultError> {
-        self.enforce_auto_lock();
-        let now = self.clock.now_secs();
-        let session = self.session.as_mut().ok_or(VaultError::Locked)?;
-        let sealed = self.cipher.encrypt(&session.key, plaintext)?;
-        session.last_activity = now;
-        Ok(sealed)
-    }
-
-    /// Decrypt protected content. Requires an unlocked vault.
-    pub fn open(&mut self, sealed: &Sealed) -> Result<Vec<u8>, VaultError> {
-        self.enforce_auto_lock();
-        let now = self.clock.now_secs();
-        let session = self.session.as_mut().ok_or(VaultError::Locked)?;
-        let plaintext = self
-            .cipher
-            .decrypt(&session.key, sealed)
-            .map_err(|_| VaultError::InvalidPassphrase)?;
-        session.last_activity = now;
-        Ok(plaintext)
-    }
-
-    /// Encrypt plaintext note content into a single storable string. Unlocked only.
-    pub fn protect(&mut self, plaintext: &str) -> Result<String, VaultError> {
-        let sealed = self.seal(plaintext.as_bytes())?;
+    /// Encrypt plaintext note content into a single storable string using the
+    /// supplied derived key.
+    pub fn seal_with(&self, key: &DerivedKey, plaintext: &str) -> Result<String, VaultError> {
+        let sealed = self.cipher.encrypt(key, plaintext.as_bytes())?;
         Ok(encode_sealed(&sealed))
     }
 
-    /// Decrypt stored protected content back to plaintext. Unlocked only.
-    pub fn reveal(&mut self, stored: &str) -> Result<String, VaultError> {
+    /// Decrypt stored protected content back to plaintext using the supplied key.
+    pub fn open_with(&self, key: &DerivedKey, stored: &str) -> Result<String, VaultError> {
         let sealed = decode_sealed(stored).ok_or(VaultError::InvalidPassphrase)?;
-        let bytes = self.open(&sealed)?;
+        let bytes = self
+            .cipher
+            .decrypt(key, &sealed)
+            .map_err(|_| VaultError::InvalidPassphrase)?;
         String::from_utf8(bytes).map_err(|_| VaultError::InvalidPassphrase)
     }
 }
@@ -156,139 +99,93 @@ fn decode_sealed(stored: &str) -> Option<Sealed> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
     use super::*;
     use crate::infra::memory_vault_repository::MemoryVaultRepository;
     use crate::infra::xchacha_cipher::XChaChaCipher;
 
-    /// A controllable clock for deterministic auto-lock tests.
-    #[derive(Clone)]
-    struct FakeClock(Rc<Cell<u64>>);
-
-    impl FakeClock {
-        fn new(start: u64) -> Self {
-            Self(Rc::new(Cell::new(start)))
-        }
-        fn advance(&self, secs: u64) {
-            self.0.set(self.0.get() + secs);
-        }
-    }
-
-    impl Clock for FakeClock {
-        fn now_secs(&self) -> u64 {
-            self.0.get()
-        }
-    }
-
-    fn service(clock: FakeClock, auto_lock_secs: u64) -> VaultService<MemoryVaultRepository, XChaChaCipher, FakeClock> {
-        VaultService::new(
-            MemoryVaultRepository::default(),
-            XChaChaCipher::new(),
-            clock,
-            auto_lock_secs,
-        )
+    fn service() -> VaultService<MemoryVaultRepository, XChaChaCipher> {
+        VaultService::new(MemoryVaultRepository::default(), XChaChaCipher::new())
     }
 
     #[test]
-    fn create_initializes_and_unlocks() {
-        let mut vault = service(FakeClock::new(1000), 300);
+    fn is_initialized_reports_false_then_true() {
+        let mut vault = service();
+        assert!(!vault.is_initialized().unwrap());
         vault.create("master-pass").unwrap();
+        assert!(vault.is_initialized().unwrap());
+    }
 
-        let status = vault.status().unwrap();
-        assert!(status.initialized);
-        assert!(status.unlocked);
+    #[test]
+    fn create_returns_a_usable_key() {
+        let mut vault = service();
+        let key = vault.create("master-pass").unwrap();
+
+        // The returned key seals and opens content without re-prompting.
+        let sealed = vault.seal_with(&key, "top secret").unwrap();
+        assert_eq!(vault.open_with(&key, &sealed).unwrap(), "top secret");
     }
 
     #[test]
     fn create_twice_fails() {
-        let mut vault = service(FakeClock::new(1000), 300);
+        let mut vault = service();
         vault.create("master-pass").unwrap();
-        assert_eq!(vault.create("master-pass"), Err(VaultError::AlreadyExists));
+        assert_eq!(
+            vault.create("master-pass").err(),
+            Some(VaultError::AlreadyExists)
+        );
     }
 
     #[test]
-    fn unlock_with_correct_passphrase_succeeds() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-        assert!(!vault.status().unwrap().unlocked);
-
-        vault.unlock("master-pass").unwrap();
-        assert!(vault.status().unwrap().unlocked);
+    fn verify_key_before_creation_reports_not_initialized() {
+        let vault = service();
+        assert_eq!(
+            vault.verify_key("whatever").err(),
+            Some(VaultError::NotInitialized)
+        );
     }
 
     #[test]
-    fn unlock_with_wrong_passphrase_fails_and_stays_locked() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
+    fn verify_key_succeeds_with_correct_passphrase() {
+        let mut vault = service();
+        let created = vault.create("master-pass").unwrap();
+        let sealed = vault.seal_with(&created, "body").unwrap();
 
-        assert_eq!(vault.unlock("wrong-pass"), Err(VaultError::InvalidPassphrase));
-        assert!(!vault.status().unwrap().unlocked);
+        let verified = vault.verify_key("master-pass").unwrap();
+        // A freshly verified key opens content sealed by the original key.
+        assert_eq!(vault.open_with(&verified, &sealed).unwrap(), "body");
     }
 
     #[test]
-    fn unlock_before_creation_reports_not_initialized() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        assert_eq!(vault.unlock("whatever"), Err(VaultError::NotInitialized));
+    fn verify_key_fails_with_wrong_passphrase() {
+        let mut vault = service();
+        vault.create("master-pass").unwrap();
+        assert_eq!(
+            vault.verify_key("wrong-pass").err(),
+            Some(VaultError::InvalidPassphrase)
+        );
     }
 
     #[test]
-    fn lock_clears_the_session() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-        assert!(!vault.status().unwrap().unlocked);
+    fn seal_then_open_roundtrips() {
+        let mut vault = service();
+        let key = vault.create("master-pass").unwrap();
+
+        let sealed = vault.seal_with(&key, "classified").unwrap();
+        assert_eq!(vault.open_with(&key, &sealed).unwrap(), "classified");
     }
 
     #[test]
-    fn auto_lock_relocks_after_inactivity() {
-        let clock = FakeClock::new(1000);
-        let mut vault = service(clock.clone(), 300);
-        vault.create("master-pass").unwrap();
-        assert!(vault.status().unwrap().unlocked);
+    fn open_with_wrong_key_fails() {
+        let mut creator = service();
+        let key = creator.create("master-pass").unwrap();
+        let sealed = creator.seal_with(&key, "classified").unwrap();
 
-        clock.advance(300);
-        assert!(!vault.status().unwrap().unlocked);
-        assert_eq!(vault.open(&dummy_sealed()), Err(VaultError::Locked));
-    }
-
-    #[test]
-    fn activity_keeps_the_session_alive() {
-        let clock = FakeClock::new(1000);
-        let mut vault = service(clock.clone(), 300);
-        vault.create("master-pass").unwrap();
-
-        clock.advance(200);
-        let sealed = vault.seal(b"note body").unwrap(); // refreshes activity
-        clock.advance(200); // 200 since last activity, below 300
-        assert!(vault.status().unwrap().unlocked);
-        assert_eq!(vault.open(&sealed).unwrap(), b"note body");
-    }
-
-    #[test]
-    fn seal_then_open_roundtrips_while_unlocked() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-
-        let sealed = vault.seal(b"top secret").unwrap();
-        assert_eq!(vault.open(&sealed).unwrap(), b"top secret");
-    }
-
-    #[test]
-    fn seal_when_locked_fails() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-        assert_eq!(vault.seal(b"secret"), Err(VaultError::Locked));
-    }
-
-    fn dummy_sealed() -> Sealed {
-        Sealed {
-            nonce: vec![0; 24],
-            ciphertext: vec![0; 32],
-        }
+        // A key derived from a different passphrase/salt cannot open the payload.
+        let mut other = service();
+        let other_key = other.create("different-pass").unwrap();
+        assert_eq!(
+            creator.open_with(&other_key, &sealed).err(),
+            Some(VaultError::InvalidPassphrase)
+        );
     }
 }
