@@ -16,34 +16,6 @@ impl<R: NoteRepository> NotesService<R> {
         })
     }
 
-    pub fn seed(&mut self) -> Result<(), NoteError> {
-        if !self.list_notes()?.is_empty() {
-            return Ok(());
-        }
-
-        self.create_note(CreateNoteInput {
-            title: "Capture from the launcher".to_string(),
-            content: "# Fast capture\n\nUse the centered search box to find notes or create a fresh Markdown note.".to_string(),
-            category: Some("Inbox".to_string()),
-        })?;
-
-        let favorite = self.create_note(CreateNoteInput {
-            title: "Architecture boundary".to_string(),
-            content: "Commands call application use cases. The in-memory repository is only an adapter and can be replaced by SQLite later.".to_string(),
-            category: Some("Design".to_string()),
-        })?;
-        self.toggle_favorite(&favorite.id)?;
-
-        let archived = self.create_note(CreateNoteInput {
-            title: "Protected notes placeholder".to_string(),
-            content: "Encryption is intentionally not implemented in this prototype. The UI shows the protected state placeholder only.".to_string(),
-            category: Some("Security".to_string()),
-        })?;
-        self.archive_note(&archived.id)?;
-
-        Ok(())
-    }
-
     pub fn create_note(&mut self, input: CreateNoteInput) -> Result<Note, NoteError> {
         let id = loop {
             let id = format!("note-{}", self.next_id);
@@ -200,20 +172,6 @@ mod tests {
             service.archive_note("missing"),
             Err(NoteError::NotFound)
         ));
-    }
-
-    #[test]
-    fn seed_is_idempotent_when_repository_already_has_notes() {
-        let mut service = service();
-        service
-            .create_note(create_input("Existing", "", None))
-            .expect("note should be valid");
-
-        service.seed().expect("seed should succeed");
-
-        let notes = service.list_notes().expect("list should succeed");
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].title, "Existing");
     }
 
     #[test]
