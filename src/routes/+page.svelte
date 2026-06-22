@@ -643,11 +643,29 @@
           </div>
 
           <div class="actions" aria-label="Note actions">
-            <button type="button" onclick={handleFavorite}>{@render btnIcon("star")}<span>{selectedNote.isFavorite ? "Starred" : "Star"}</span></button>
-            <button type="button" onclick={handleArchive}>{@render btnIcon("archive")}<span>{selectedNote.isArchived ? "Restore" : "Archive"}</span></button>
-            <button type="button" onclick={handleToggleProtection}>{@render btnIcon(selectedNote.isProtected ? "unlock" : "lock")}<span>{selectedNote.isProtected ? "Unprotect" : "Protect"}</span></button>
-            <button type="button" onclick={handleExport}>{@render btnIcon("download")}<span>Export</span></button>
-            <button class="danger" type="button" onclick={handleDelete}>{@render btnIcon("trash")}<span>Delete</span></button>
+            <button
+              class:on-star={selectedNote.isFavorite}
+              type="button"
+              aria-pressed={selectedNote.isFavorite}
+              title={selectedNote.isFavorite ? "Remove from favorites" : "Add to favorites"}
+              onclick={handleFavorite}
+            >{@render btnIcon("star")}<span>{selectedNote.isFavorite ? "Starred" : "Star"}</span></button>
+            <button
+              class:on-archive={selectedNote.isArchived}
+              type="button"
+              aria-pressed={selectedNote.isArchived}
+              title={selectedNote.isArchived ? "Move back to active notes" : "Move to archive"}
+              onclick={handleArchive}
+            >{@render btnIcon("archive")}<span>{selectedNote.isArchived ? "Restore" : "Archive"}</span></button>
+            <button
+              class:on-protect={selectedNote.isProtected}
+              type="button"
+              aria-pressed={selectedNote.isProtected}
+              title={selectedNote.isProtected ? "Decrypt and remove protection" : "Encrypt with your vault passphrase"}
+              onclick={handleToggleProtection}
+            >{@render btnIcon(selectedNote.isProtected ? "unlock" : "lock")}<span>{selectedNote.isProtected ? "Unprotect" : "Protect"}</span></button>
+            <button type="button" title="Export this note as a Markdown file" onclick={handleExport}>{@render btnIcon("download")}<span>Export</span></button>
+            <button class="danger" type="button" title="Delete this note permanently" onclick={handleDelete}>{@render btnIcon("trash")}<span>Delete</span></button>
             <button class={["save", "save-status", saveStatus]} type="button" onclick={handleSave} title="Save now (Ctrl+S)">{@render btnIcon("check")}<span>{saveLabel}</span></button>
           </div>
         </header>
@@ -1332,6 +1350,25 @@
     color: var(--danger);
     border-color: var(--danger);
     background: var(--danger-bg);
+  }
+
+  /* Active-state cues so each toggle action reads at a glance. */
+  .actions .on-star {
+    color: #d8c08a;
+    border-color: rgba(216, 192, 138, 0.4);
+    background: rgba(216, 192, 138, 0.12);
+  }
+
+  .actions .on-protect {
+    color: #b9a3e3;
+    border-color: rgba(185, 163, 227, 0.4);
+    background: rgba(185, 163, 227, 0.12);
+  }
+
+  .actions .on-archive {
+    color: var(--text-2);
+    border-color: var(--line-strong);
+    background: var(--surface-active);
   }
 
   .title-stack input:disabled {
