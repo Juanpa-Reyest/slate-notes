@@ -107,6 +107,41 @@ describe("createAutosave", () => {
     expect(statuses).toEqual(["pending", "saving", "error"]);
   });
 
+  it("flush waits for an in-flight save to finish before resolving", async () => {
+    const order: string[] = [];
+    let resolveSave: () => void = () => {};
+    const save = vi.fn().mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveSave = () => {
+            order.push("saved");
+            resolve();
+          };
+        }),
+    );
+    const autosave = createAutosave(save, { delayMs: 800 });
+
+    autosave.schedule();
+    await vi.advanceTimersByTimeAsync(800); // save is now in flight
+    expect(save).toHaveBeenCalledTimes(1);
+
+    let flushed = false;
+    const flushPromise = autosave.flush().then(() => {
+      order.push("flush-resolved");
+      flushed = true;
+    });
+
+    // flush must NOT resolve while the save is still running.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(flushed).toBe(false);
+
+    resolveSave();
+    await flushPromise;
+    expect(flushed).toBe(true);
+    expect(order).toEqual(["saved", "flush-resolved"]);
+  });
+
   it("does not start a new save while one is already in flight", async () => {
     let resolveSave: () => void = () => {};
     const save = vi.fn().mockImplementation(

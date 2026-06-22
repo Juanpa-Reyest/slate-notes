@@ -3,8 +3,9 @@
  *
  * Keeps save policy out of the UI component so it can be unit-tested in
  * isolation. The controller coalesces rapid edits into a single write,
- * never runs two saves concurrently, and exposes a flush() for moments
- * that must persist immediately (explicit save, switching notes, closing).
+ * never runs two saves concurrently, and exposes a flush() that resolves
+ * only once everything pending has actually been persisted — so callers
+ * can rely on `await flush()` before navigating away or closing.
  */
 export type SaveStatus = "idle" | "pending" | "saving" | "saved" | "error";
 
@@ -18,7 +19,7 @@ export interface AutosaveOptions {
 export interface Autosave {
   /** Mark the content dirty and (re)arm the debounce timer. */
   schedule(): void;
-  /** Persist any pending change right now, bypassing the timer. */
+  /** Persist everything pending right now and resolve once it is saved. */
   flush(): Promise<void>;
   /** Drop any pending change without saving. */
   cancel(): void;
@@ -32,9 +33,8 @@ export function createAutosave(
   const onStatus = options.onStatus;
 
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let pending = false; // a change is waiting to be saved
-  let inFlight = false; // a save is currently running
-  let queued = false; // a change arrived while a save was in flight
+  let dirty = false; // there is an unsaved change
+  let draining: Promise<void> | null = null; // the active drain loop, if any
 
   function setStatus(status: SaveStatus) {
     onStatus?.(status);
@@ -47,54 +47,55 @@ export function createAutosave(
     }
   }
 
-  async function runSave(): Promise<void> {
-    clearTimer();
-
-    if (inFlight) {
-      // Don't run two saves at once; remember to save again afterwards.
-      queued = true;
-      return;
-    }
-    if (!pending) return;
-
-    pending = false;
-    inFlight = true;
-    setStatus("saving");
-    try {
-      await save();
-      setStatus("saved");
-    } catch {
-      // Keep the change dirty so a later edit or flush can retry it.
-      pending = true;
-      setStatus("error");
-    } finally {
-      inFlight = false;
-      if (queued) {
-        queued = false;
-        schedule();
+  // Persist the dirty state, then keep saving while new edits keep arriving.
+  // Stops on the first failure to avoid a hot retry loop; the change stays
+  // dirty so a later edit or flush() can try again. The single-drain guard in
+  // startDrain() guarantees two saves never run concurrently.
+  async function drain(): Promise<void> {
+    while (dirty) {
+      dirty = false;
+      setStatus("saving");
+      try {
+        await save();
+        setStatus("saved");
+      } catch {
+        dirty = true;
+        setStatus("error");
+        return;
       }
     }
   }
 
+  function startDrain(): Promise<void> {
+    if (draining) return draining;
+    draining = drain().finally(() => {
+      draining = null;
+    });
+    return draining;
+  }
+
+  function trigger() {
+    clearTimer();
+    if (dirty) void startDrain();
+  }
+
   function schedule(): void {
-    pending = true;
+    dirty = true;
     setStatus("pending");
     clearTimer();
-    timer = setTimeout(() => {
-      void runSave();
-    }, delayMs);
+    timer = setTimeout(trigger, delayMs);
   }
 
   async function flush(): Promise<void> {
     clearTimer();
-    if (!pending && !queued) return;
-    await runSave();
+    // Wait for any in-flight drain, then ensure anything still dirty is saved.
+    if (draining) await draining;
+    if (dirty) await startDrain();
   }
 
   function cancel(): void {
     clearTimer();
-    pending = false;
-    queued = false;
+    dirty = false;
     setStatus("idle");
   }
 

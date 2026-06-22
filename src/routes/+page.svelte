@@ -347,6 +347,7 @@
         vaultMode === "create"
           ? await createVault(passphrase)
           : await unlockVault(passphrase);
+      // Snapshot the intent BEFORE closeVaultDialog(), which clears it.
       const intent = pendingProtect;
       closeVaultDialog();
       await refresh();
@@ -679,6 +680,7 @@
                 type="button"
                 aria-haspopup="listbox"
                 aria-expanded={isCategoryMenuOpen}
+                disabled={isNoteLocked}
                 onclick={toggleCategoryMenu}
               >
                 <span class={["category-dot", categoryOption(selectedNote.category).tone]} aria-hidden="true"></span>
@@ -713,6 +715,7 @@
                 type="button"
                 aria-haspopup="listbox"
                 aria-expanded={isColorMenuOpen}
+                disabled={isNoteLocked}
                 onclick={toggleColorMenu}
               >
                 <span class={["color-swatch", selectedNote.color]} aria-hidden="true"></span>
@@ -1371,7 +1374,8 @@
     background: var(--surface-active);
   }
 
-  .title-stack input:disabled {
+  .title-stack input:disabled,
+  .custom-trigger:disabled {
     opacity: 0.55;
     cursor: not-allowed;
   }
