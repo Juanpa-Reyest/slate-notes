@@ -11,8 +11,8 @@
     updateNote,
     vaultStatus,
     createVault,
-    unlockVault,
-    lockVault,
+    revealNote,
+    clearActive,
     protectNote,
     unprotectNote,
     exportNote,
@@ -69,20 +69,24 @@
 
   let vault = $state<VaultStatus>({ initialized: false, unlocked: false });
   let isVaultDialogOpen = $state(false);
-  let vaultMode = $state<"create" | "unlock">("unlock");
+  let vaultMode = $state<"create" | "passphrase">("passphrase");
   let passphrase = $state("");
   let passphraseConfirm = $state("");
   let vaultError = $state("");
   let noticeMessage = $state("");
-  // Remembers a protect/unprotect the user asked for while the vault was locked,
-  // so it completes automatically once they unlock instead of silently dropping.
+  // The id of the note whose plaintext is currently shown (the active note).
+  let revealedNoteId = $state<string | null>(null);
+  // Passphrase typed into the inline reveal panel; cleared right after use.
+  let revealPassphrase = $state("");
+  // Remembers a protect/unprotect the user asked for; the vault dialog collects
+  // the passphrase and then completes the operation with it.
   let pendingProtect = $state<{ id: string; protect: boolean } | null>(null);
 
   let sourceNotes = $derived(notes);
   let categoryItems = $derived(buildCategoryItems(sourceNotes));
   let visibleNotes = $derived(filterNotes(sourceNotes, selectedCategory, searchQuery));
   let previewHtml = $derived(selectedNote ? marked.parse(selectedNote.content) : "");
-  let isNoteLocked = $derived(!!selectedNote?.isProtected && !vault.unlocked);
+  let isNoteLocked = $derived(!!selectedNote?.isProtected && revealedNoteId !== selectedNote?.id);
   let saveLabel = $derived(formatSaveLabel(saveStatus, lastSavedAt));
 
   onMount(async () => {
@@ -193,13 +197,23 @@
   }
 
   async function refresh(nextSelectedId = selectedNote?.id) {
+    const previous = selectedNote;
     const nextNotes = searchQuery.trim()
       ? await searchNotes(searchQuery)
       : await listNotes();
     notes = nextNotes;
 
     const nextVisibleNotes = filterNotes(nextNotes, selectedCategory, searchQuery);
-    selectedNote = nextVisibleNotes.find((note) => note.id === nextSelectedId) ?? nextVisibleNotes[0] ?? nextNotes[0] ?? null;
+    let next = nextVisibleNotes.find((note) => note.id === nextSelectedId) ?? nextVisibleNotes[0] ?? nextNotes[0] ?? null;
+
+    // The list returns protected notes blanked. If we are re-selecting the note
+    // that is currently revealed, keep its already-decrypted plaintext instead
+    // of the blanked list copy (otherwise its content would vanish from view).
+    if (next && previous && next.id === previous.id && revealedNoteId === next.id) {
+      next = { ...next, content: previous.content };
+    }
+
+    selectedNote = next;
   }
 
   async function handleSearch() {
@@ -228,8 +242,10 @@
   async function persistSelectedNote() {
     const note = selectedNote;
     if (!note) return;
-    // Never overwrite a protected note's encrypted content while locked.
-    if (note.isProtected && !vault.unlocked) return;
+    // Never overwrite a protected note's encrypted content while it is locked.
+    // When it is the active (revealed) note, autosave is allowed: the backend
+    // re-seals with the active key.
+    if (note.isProtected && revealedNoteId !== note.id) return;
 
     await updateNote({
       id: note.id,
@@ -256,7 +272,7 @@
   // Mark the current note dirty so autosave persists it after a short pause.
   function scheduleAutosave() {
     if (!selectedNote) return;
-    if (selectedNote.isProtected && !vault.unlocked) return;
+    if (selectedNote.isProtected && revealedNoteId !== selectedNote.id) return;
     autosave.schedule();
   }
 
@@ -309,13 +325,17 @@
     const deletedId = selectedNote.id;
     await run(async () => {
       autosave.cancel();
+      if (revealedNoteId === deletedId) revealedNoteId = null;
+      // The backend clears the active key on delete; no clearActive() needed.
       await deleteNote(deletedId);
       await refresh();
     });
   }
 
-  function openVaultDialog() {
-    vaultMode = vault.initialized ? "unlock" : "create";
+  // Opens the dialog either to set up a new vault ("create") or to collect the
+  // passphrase for a pending protect/unprotect operation ("passphrase").
+  function openVaultDialog(mode: "create" | "passphrase") {
+    vaultMode = mode;
     passphrase = "";
     passphraseConfirm = "";
     vaultError = "";
@@ -342,18 +362,20 @@
       return;
     }
 
+    // Snapshot the entered passphrase and intent BEFORE closeVaultDialog()
+    // clears the bound fields, then run the operation and drop the passphrase.
+    const enteredPassphrase = passphrase;
+    const intent = pendingProtect;
+    const mode = vaultMode;
+
     try {
-      vault =
-        vaultMode === "create"
-          ? await createVault(passphrase)
-          : await unlockVault(passphrase);
-      // Snapshot the intent BEFORE closeVaultDialog(), which clears it.
-      const intent = pendingProtect;
+      if (mode === "create") {
+        vault = await createVault(enteredPassphrase);
+      }
       closeVaultDialog();
       await refresh();
-      // Finish what the user originally asked for before the unlock detour.
       if (intent) {
-        await applyProtection(intent.id, intent.protect);
+        await applyProtection(intent.id, intent.protect, enteredPassphrase);
       }
     } catch (error) {
       vaultError = error instanceof Error ? error.message : String(error);
@@ -368,15 +390,25 @@
     }
   }
 
-  async function handleVaultButton() {
-    if (vault.unlocked) {
-      await run(async () => {
-        await autosave.flush();
-        vault = await lockVault();
-        await refresh();
-      });
-    } else {
-      openVaultDialog();
+  // Reveal flow: unlock the currently selected locked note with its passphrase.
+  async function handleReveal() {
+    const note = selectedNote;
+    if (!note) return;
+    const enteredPassphrase = revealPassphrase;
+    await run(async () => {
+      const revealed = await revealNote(note.id, enteredPassphrase);
+      selectedNote = revealed;
+      revealedNoteId = revealed.id;
+      vault = await vaultStatus();
+    });
+    // Never keep the passphrase around, regardless of success or failure.
+    revealPassphrase = "";
+  }
+
+  function handleRevealKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleReveal();
     }
   }
 
@@ -385,23 +417,33 @@
     const note = selectedNote;
     const protect = !note.isProtected;
 
-    // Both protecting (encrypt) and unprotecting (decrypt) need the key, so an
-    // unlocked vault is required. If it is locked, remember the intent and let
-    // the vault dialog finish the job after a successful unlock.
-    if (!vault.unlocked) {
-      pendingProtect = { id: note.id, protect };
-      openVaultDialog();
+    // Protecting a note when no vault exists yet → set one up first via the
+    // create dialog, which then completes the protect with the new passphrase.
+    if (protect && !vault.initialized) {
+      pendingProtect = { id: note.id, protect: true };
+      openVaultDialog("create");
       return;
     }
 
-    await applyProtection(note.id, protect);
+    // Otherwise both protect and unprotect need the passphrase: collect it.
+    pendingProtect = { id: note.id, protect };
+    openVaultDialog("passphrase");
   }
 
-  async function applyProtection(id: string, protect: boolean) {
+  async function applyProtection(id: string, protect: boolean, enteredPassphrase: string) {
     await run(async () => {
       await autosave.flush();
-      const updated = protect ? await protectNote(id) : await unprotectNote(id);
+      const updated = protect
+        ? await protectNote(id, enteredPassphrase)
+        : await unprotectNote(id, enteredPassphrase);
+      // Refresh the list FIRST (it returns the protected note blanked), then
+      // override selectedNote with the plaintext `updated` so the just-protected
+      // note keeps showing its content instead of the blanked list copy.
       await refresh(updated.id);
+      // Protecting leaves the note active (revealed); unprotecting clears it.
+      revealedNoteId = protect ? updated.id : null;
+      selectedNote = updated;
+      vault = await vaultStatus();
       noticeMessage = protect ? "Note protected 🔒" : "Note unprotected";
     });
   }
@@ -410,6 +452,11 @@
     if (!selectedNote) return;
     noticeMessage = "";
     errorMessage = "";
+    // A protected note that is not revealed would export blank; guard it.
+    if (isNoteLocked) {
+      noticeMessage = "Reveal the note before exporting.";
+      return;
+    }
     try {
       const where = await exportNote(selectedNote.id);
       noticeMessage = `Exported to ${where}`;
@@ -435,8 +482,19 @@
     }
   }
 
-  async function selectCategory(categoryId: string) {
+  // Re-seal pending edits with the active key (flush) BEFORE dropping it
+  // (clearActive). Order matters: flush needs the active key to persist the
+  // revealed note's content.
+  async function leaveActiveNote() {
     await autosave.flush();
+    if (vault.unlocked) {
+      vault = await clearActive();
+    }
+    revealedNoteId = null;
+  }
+
+  async function selectCategory(categoryId: string) {
+    await leaveActiveNote();
     selectedCategory = categoryId;
     const nextVisibleNotes = filterNotes(notes, categoryId, searchQuery);
     selectedNote = nextVisibleNotes[0] ?? null;
@@ -447,7 +505,7 @@
 
   async function selectNote(note: Note) {
     if (note.id === selectedNote?.id) return;
-    await autosave.flush();
+    await leaveActiveNote();
     selectedNote = note;
     isMarkdownEditing = false;
     isCategoryMenuOpen = false;
@@ -564,16 +622,6 @@
         </div>
 
         <button class="new-button" type="button" onclick={handleCreate}>{@render btnIcon("plus")}<span>New note</span></button>
-
-        <button class="vault-toggle" type="button" onclick={handleVaultButton}>
-          {#if vault.unlocked}
-            {@render btnIcon("unlock")}<span>Lock vault</span>
-          {:else if vault.initialized}
-            {@render btnIcon("lock")}<span>Unlock vault</span>
-          {:else}
-            {@render btnIcon("lock")}<span>Set up vault</span>
-          {/if}
-        </button>
       </div>
 
       {#if errorMessage}
@@ -764,12 +812,23 @@
           <span class="status-chip">{colorLabel(selectedNote.color)}</span>
         </div>
 
-        {#if selectedNote.isProtected && !vault.unlocked}
+        {#if isNoteLocked}
           <div class="locked-panel">
             <span class="locked-icon" aria-hidden="true">🔒</span>
             <h2>This note is protected</h2>
-            <p>Unlock the vault to read and edit its content.</p>
-            <button class="save" type="button" onclick={openVaultDialog}>Unlock vault</button>
+            <p>Enter the passphrase to read and edit its content.</p>
+            <div class="reveal-form">
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                type="password"
+                autocomplete="off"
+                placeholder="Passphrase"
+                aria-label="Note passphrase"
+                bind:value={revealPassphrase}
+                onkeydown={handleRevealKeydown}
+              />
+              <button class="save" type="button" onclick={handleReveal}>Unlock</button>
+            </div>
           </div>
         {:else}
         <div class="editor-layout" class:preview-only={!isMarkdownEditing}>
@@ -823,11 +882,11 @@
   {#if isVaultDialogOpen}
     <div class="vault-overlay" role="dialog" aria-modal="true" aria-label="Vault passphrase">
       <div class="vault-dialog">
-        <h2>{vaultMode === "create" ? "Set up your vault" : "Unlock your vault"}</h2>
+        <h2>{vaultMode === "create" ? "Set up your vault" : "Enter your passphrase"}</h2>
         <p>
           {vaultMode === "create"
             ? "Choose a master passphrase. It protects all protected notes and is never stored. If you forget it, protected notes cannot be recovered."
-            : "Enter your master passphrase to read protected notes."}
+            : "Enter your master passphrase to continue."}
         </p>
 
         <label for="vault-pass">Passphrase</label>
@@ -846,7 +905,7 @@
         <div class="vault-actions">
           <button type="button" onclick={closeVaultDialog}>Cancel</button>
           <button class="save" type="button" onclick={submitVault}>
-            {vaultMode === "create" ? "Create vault" : "Unlock"}
+            {vaultMode === "create" ? "Create vault" : "Continue"}
           </button>
         </div>
       </div>
@@ -1088,7 +1147,7 @@
 
   .sidebar-tools {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 1fr;
     gap: 8px;
   }
 
@@ -1684,25 +1743,26 @@
     padding: 0 14px;
   }
 
-  .vault-toggle {
-    grid-column: 1 / -1;
-    min-height: 34px;
-    display: inline-flex;
+  .reveal-form {
+    display: flex;
+    gap: 8px;
     align-items: center;
-    justify-content: center;
-    gap: 6px;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
-    color: var(--text);
-    background: var(--btn);
-    font-size: 0.82rem;
-    font-weight: 500;
+    margin-top: 10px;
   }
 
-  .vault-toggle:hover {
-    border-color: var(--accent-line);
-    background: var(--btn-hover);
+  .reveal-form input {
+    min-height: 36px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
     color: var(--text);
+    background: var(--bg);
+    padding: 0 10px;
+    font-size: 0.9rem;
+  }
+
+  .reveal-form .save {
+    min-height: 36px;
+    padding: 0 14px;
   }
 
   .locked-panel {
