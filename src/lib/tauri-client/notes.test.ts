@@ -38,30 +38,30 @@ describe("tauri-client browser-preview fallback", () => {
     expect(misses.length).toBe(0);
   });
 
-  it("creating the vault does not open any note", async () => {
-    const status = await notes.createVault("master");
-    expect(status.initialized).toBe(true);
-    expect(status.unlocked).toBe(false);
+  it("setting up recovery does not open any note", async () => {
+    const status = await notes.setUpRecovery("master");
+    expect(status.recoveryInitialized).toBe(true);
+    expect(status.activeNoteOpen).toBe(false);
   });
 
-  it("protect requires a vault and verifies the passphrase", async () => {
+  it("protect requires recovery setup and verifies the passphrase", async () => {
     const target = (await notes.listNotes())[0];
 
-    // No vault yet → cannot protect.
+    // No recovery set up yet → cannot protect.
     await expect(notes.protectNote(target.id, "master")).rejects.toThrow();
 
-    await notes.createVault("master");
+    await notes.setUpRecovery("master");
     // Wrong passphrase is rejected.
     await expect(notes.protectNote(target.id, "wrong")).rejects.toThrow();
 
     const protectedNote = await notes.protectNote(target.id, "master");
     expect(protectedNote.isProtected).toBe(true);
     // The protected note becomes the active (revealed) one.
-    expect((await notes.vaultStatus()).unlocked).toBe(true);
+    expect((await notes.recoveryStatus()).activeNoteOpen).toBe(true);
   });
 
   it("always blanks protected content in list and search", async () => {
-    await notes.createVault("master");
+    await notes.setUpRecovery("master");
     const target = (await notes.listNotes())[0];
     await notes.protectNote(target.id, "master");
 
@@ -77,7 +77,7 @@ describe("tauri-client browser-preview fallback", () => {
   });
 
   it("reveals plaintext with the correct passphrase and rejects a wrong one", async () => {
-    await notes.createVault("master");
+    await notes.setUpRecovery("master");
     const target = (await notes.listNotes())[0];
     const original = target.content;
     await notes.protectNote(target.id, "master");
@@ -88,11 +88,11 @@ describe("tauri-client browser-preview fallback", () => {
 
     const revealed = await notes.revealNote(target.id, "master");
     expect(revealed.content).toBe(original);
-    expect((await notes.vaultStatus()).unlocked).toBe(true);
+    expect((await notes.recoveryStatus()).activeNoteOpen).toBe(true);
   });
 
   it("rejects updating a protected note that is not active", async () => {
-    await notes.createVault("master");
+    await notes.setUpRecovery("master");
     const target = (await notes.listNotes())[0];
     await notes.protectNote(target.id, "master");
     await notes.clearActive();
@@ -110,18 +110,18 @@ describe("tauri-client browser-preview fallback", () => {
   });
 
   it("clearActive drops the open state", async () => {
-    await notes.createVault("master");
+    await notes.setUpRecovery("master");
     const target = (await notes.listNotes())[0];
     await notes.protectNote(target.id, "master");
-    expect((await notes.vaultStatus()).unlocked).toBe(true);
+    expect((await notes.recoveryStatus()).activeNoteOpen).toBe(true);
 
     const status = await notes.clearActive();
-    expect(status.unlocked).toBe(false);
-    expect((await notes.vaultStatus()).unlocked).toBe(false);
+    expect(status.activeNoteOpen).toBe(false);
+    expect((await notes.recoveryStatus()).activeNoteOpen).toBe(false);
   });
 
   it("unprotect restores plaintext and clears the active state", async () => {
-    await notes.createVault("master");
+    await notes.setUpRecovery("master");
     const target = (await notes.listNotes())[0];
     const original = target.content;
     await notes.protectNote(target.id, "master");
@@ -129,8 +129,29 @@ describe("tauri-client browser-preview fallback", () => {
     const restored = await notes.unprotectNote(target.id, "master");
     expect(restored.isProtected).toBe(false);
     expect(restored.content).toBe(original);
-    expect((await notes.vaultStatus()).unlocked).toBe(false);
+    expect((await notes.recoveryStatus()).activeNoteOpen).toBe(false);
 
+    const listed = await notes.listNotes();
+    expect(listed.find((note) => note.id === target.id)?.content).toBe(original);
+  });
+
+  it("recovers a protected note: rejects a wrong passphrase, then restores plaintext and drops protection", async () => {
+    await notes.setUpRecovery("master");
+    const target = (await notes.listNotes())[0];
+    const original = target.content;
+    await notes.protectNote(target.id, "master");
+    await notes.clearActive();
+
+    // A wrong recovery passphrase is rejected.
+    await expect(notes.recoverNote(target.id, "wrong")).rejects.toThrow();
+
+    // The correct recovery passphrase restores the content and removes protection.
+    const recovered = await notes.recoverNote(target.id, "master");
+    expect(recovered.isProtected).toBe(false);
+    expect(recovered.content).toBe(original);
+    expect((await notes.recoveryStatus()).activeNoteOpen).toBe(false);
+
+    // The restored plaintext is visible in the list again.
     const listed = await notes.listNotes();
     expect(listed.find((note) => note.id === target.id)?.content).toBe(original);
   });

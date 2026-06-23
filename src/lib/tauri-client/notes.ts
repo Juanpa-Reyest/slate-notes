@@ -29,10 +29,10 @@ export type UpdateNoteInput = {
   color: string;
 };
 
-export type VaultStatus = {
-  initialized: boolean;
-  // "unlocked" now means a protected note is currently open (a transient key is held).
-  unlocked: boolean;
+export type RecoveryStatus = {
+  recoveryInitialized: boolean;
+  // "activeNoteOpen" means a protected note is currently open (a transient key is held).
+  activeNoteOpen: boolean;
 };
 
 const isTauriRuntime = () =>
@@ -99,19 +99,19 @@ let previewNotes: Note[] = [
   },
 ];
 
-// Preview vault state mirrors the redesigned backend model:
-// - `initialized` tracks whether a vault passphrase has been set.
+// Preview recovery state mirrors the redesigned backend model:
+// - `recoveryInitialized` tracks whether a recovery passphrase has been set.
 // - `activeId` is the id of the single protected note currently revealed
 //   (the transient key concept); mocked here by remembering the passphrase
 //   used to open it.
-let previewVault: { initialized: boolean } = { initialized: false };
+let previewVault: { recoveryInitialized: boolean } = { recoveryInitialized: false };
 let previewPassphrase = "";
 let previewActiveId: string | null = null;
 // Per-note ciphertext (mocked as the stored plaintext secret).
 const previewSecrets: Record<string, string> = {};
 
-function previewVaultStatus(): VaultStatus {
-  return { initialized: previewVault.initialized, unlocked: previewActiveId !== null };
+function previewRecoveryStatus(): RecoveryStatus {
+  return { recoveryInitialized: previewVault.recoveryInitialized, activeNoteOpen: previewActiveId !== null };
 }
 
 function cloneNote(note: Note) {
@@ -250,21 +250,21 @@ export function deleteNote(id: string) {
   return invoke<void>("delete_note", { input: { id } });
 }
 
-export function vaultStatus() {
-  if (!isTauriRuntime()) return Promise.resolve(previewVaultStatus());
+export function recoveryStatus() {
+  if (!isTauriRuntime()) return Promise.resolve(previewRecoveryStatus());
 
-  return invoke<VaultStatus>("vault_status");
+  return invoke<RecoveryStatus>("recovery_status");
 }
 
-export function createVault(passphrase: string) {
+export function setUpRecovery(passphrase: string) {
   if (!isTauriRuntime()) {
-    // Creating the vault sets the passphrase but does NOT open any note.
+    // Setting up recovery stores the passphrase but does NOT open any note.
     previewPassphrase = passphrase;
-    previewVault = { initialized: true };
-    return Promise.resolve(previewVaultStatus());
+    previewVault = { recoveryInitialized: true };
+    return Promise.resolve(previewRecoveryStatus());
   }
 
-  return invoke<VaultStatus>("create_vault", { input: { passphrase } });
+  return invoke<RecoveryStatus>("set_up_recovery", { input: { passphrase } });
 }
 
 export function revealNote(id: string, passphrase: string) {
@@ -287,19 +287,19 @@ export function revealNote(id: string, passphrase: string) {
 export function clearActive() {
   if (!isTauriRuntime()) {
     previewActiveId = null;
-    return Promise.resolve(previewVaultStatus());
+    return Promise.resolve(previewRecoveryStatus());
   }
 
-  return invoke<VaultStatus>("clear_active");
+  return invoke<RecoveryStatus>("clear_active");
 }
 
 export function protectNote(id: string, passphrase: string) {
   if (!isTauriRuntime()) {
     const note = previewNotes.find((item) => item.id === id);
     if (!note) return Promise.reject(new Error("Note not found"));
-    // Protecting verifies the passphrase against an existing vault.
-    if (!previewVault.initialized) {
-      return Promise.reject(new Error("Set up your vault first."));
+    // Protecting verifies the passphrase against the recovery setup.
+    if (!previewVault.recoveryInitialized) {
+      return Promise.reject(new Error("Recovery has not been set up yet."));
     }
     if (passphrase !== previewPassphrase) {
       return Promise.reject(new Error("Invalid passphrase."));
@@ -321,8 +321,8 @@ export function unprotectNote(id: string, passphrase: string) {
   if (!isTauriRuntime()) {
     const note = previewNotes.find((item) => item.id === id);
     if (!note) return Promise.reject(new Error("Note not found"));
-    if (!previewVault.initialized) {
-      return Promise.reject(new Error("Set up your vault first."));
+    if (!previewVault.recoveryInitialized) {
+      return Promise.reject(new Error("Recovery has not been set up yet."));
     }
     if (passphrase !== previewPassphrase) {
       return Promise.reject(new Error("Invalid passphrase."));
@@ -336,6 +336,27 @@ export function unprotectNote(id: string, passphrase: string) {
   }
 
   return invoke<Note>("unprotect_note", { input: { id, passphrase } });
+}
+
+export function recoverNote(id: string, passphrase: string) {
+  if (!isTauriRuntime()) {
+    const note = previewNotes.find((item) => item.id === id);
+    if (!note) return Promise.reject(new Error("Note not found"));
+    if (!previewVault.recoveryInitialized) {
+      return Promise.reject(new Error("Recovery has not been set up yet."));
+    }
+    if (passphrase !== previewPassphrase) {
+      return Promise.reject(new Error("Invalid passphrase."));
+    }
+
+    note.content = previewSecrets[id] ?? note.content;
+    delete previewSecrets[id];
+    note.isProtected = false;
+    if (previewActiveId === id) previewActiveId = null;
+    return Promise.resolve(cloneNote(note));
+  }
+
+  return invoke<Note>("recover_note", { input: { id, passphrase } });
 }
 
 export function exportNote(id: string) {
