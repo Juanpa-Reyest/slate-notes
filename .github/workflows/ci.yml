@@ -1,0 +1,55 @@
+name: CI
+
+# Runs the full test suite on every pull request into main (and on pushes to
+# dev) so a change that breaks the build, the types, or the tests can never be
+# merged into main. Wire this job as a required status check on the main branch.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system dependencies (Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            build-essential \
+            curl wget file libssl-dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check (svelte-check)
+        run: npm run check
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
