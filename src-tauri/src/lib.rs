@@ -28,11 +28,22 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&app_data_dir)?;
-            let db_path = app_data_dir.join("notes.sqlite");
-            log::info!("Slate starting; database at {}", db_path.display());
-            app.manage(AppState::sqlite(db_path)?);
+            // Storage mode: volatile in-memory in DEBUG builds (nothing is
+            // persisted, everything is wiped on close), persistent SQLite in
+            // RELEASE builds.
+            #[cfg(debug_assertions)]
+            {
+                log::info!("Slate starting in DEBUG mode; storage is VOLATILE (in-memory, not persisted)");
+                app.manage(AppState::memory()?);
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                let app_data_dir = app.path().app_data_dir()?;
+                std::fs::create_dir_all(&app_data_dir)?;
+                let db_path = app_data_dir.join("notes.sqlite");
+                log::info!("Slate starting in RELEASE mode; database at {}", db_path.display());
+                app.manage(AppState::sqlite(db_path)?);
+            }
             log::info!("application state ready");
             Ok(())
         })
@@ -45,12 +56,13 @@ pub fn run() {
             commands::notes::archive_note,
             commands::notes::delete_note,
             commands::notes::export_note,
-            commands::vault::vault_status,
-            commands::vault::create_vault,
+            commands::vault::recovery_status,
+            commands::vault::set_up_recovery,
             commands::vault::reveal_note,
             commands::vault::clear_active,
             commands::vault::protect_note,
             commands::vault::unprotect_note,
+            commands::vault::recover_note,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

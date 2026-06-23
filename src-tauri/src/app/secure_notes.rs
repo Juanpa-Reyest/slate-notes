@@ -1,15 +1,17 @@
-//! Coordinator that ties the notes service and the vault together under STRICT
-//! PER-NOTE authentication. A protected note is stored encrypted and is revealed
-//! only when its passphrase is supplied at that moment. There is no persistent
-//! unlocked session: the only key held in memory is the transient key for the
+//! Coordinator that ties the notes service and the recovery vault together
+//! under PER-NOTE authentication with asymmetric master recovery.
+//!
+//! Each protected note carries its own random DEK, wrapped under its own
+//! password AND escrowed to the master public key. There is no persistent
+//! unlocked session: the only key held in memory is the transient DEK for the
 //! note the user currently has open, so autosave can re-seal edits without
-//! re-prompting per keystroke. That key is cleared when the user navigates away.
+//! re-prompting per keystroke. That DEK is cleared when the user navigates away.
 
 use crate::app::notes_service::NotesService;
 use crate::app::vault_service::VaultService;
-use crate::domain::encryption::DerivedKey;
+use crate::domain::encryption::{DerivedKey, PAYLOAD_VERSION};
 use crate::domain::note::{CreateNoteInput, Note, NoteError, UpdateNoteInput};
-use crate::domain::vault::{VaultError, VaultStatus};
+use crate::domain::vault::{ProtectedPayload, RecoveryStatus, VaultError};
 use crate::ports::cipher::Cipher;
 use crate::ports::note_repository::NoteRepository;
 use crate::ports::vault_repository::VaultRepository;
@@ -46,7 +48,7 @@ impl std::error::Error for SecureNotesError {}
 pub struct SecureNotesService<NR: NoteRepository, VR, C> {
     notes: NotesService<NR>,
     vault: VaultService<VR, C>,
-    /// The transient key for the currently-open protected note: (note id, key).
+    /// The transient DEK for the currently-open protected note: (note id, DEK).
     /// This is the ONLY decrypted-key state the app holds. It exists so autosave
     /// can re-seal edits to the open note without re-prompting per keystroke.
     active: Option<(String, DerivedKey)>,
@@ -66,26 +68,24 @@ where
         }
     }
 
-    // --- Vault control ---
+    // --- Recovery control ---
 
-    /// Vault status for the UI. `unlocked` now means "a protected note is open"
-    /// (i.e. a transient key is held), keeping the existing shape for the
-    /// frontend.
-    pub fn vault_status(&self) -> Result<VaultStatus, SecureNotesError> {
-        Ok(VaultStatus {
-            initialized: self.vault.is_initialized()?,
-            unlocked: self.active.is_some(),
+    /// Recovery/auth status for the UI.
+    pub fn recovery_status(&self) -> Result<RecoveryStatus, SecureNotesError> {
+        Ok(RecoveryStatus {
+            recovery_initialized: self.vault.is_initialized()?,
+            active_note_open: self.active.is_some(),
         })
     }
 
-    pub fn create_vault(&mut self, passphrase: &str) -> Result<(), SecureNotesError> {
-        // Creating the vault derives a key but there is no open note yet, so we
-        // do not retain it as the active key.
-        let _key = self.vault.create(passphrase)?;
+    /// Set up master recovery once. Generates the X25519 keypair, seals the
+    /// private key under the master passphrase, and persists the record.
+    pub fn set_up_recovery(&mut self, master_pass: &str) -> Result<(), SecureNotesError> {
+        self.vault.set_up_recovery(master_pass)?;
         Ok(())
     }
 
-    /// Drop the transient key for the currently-open protected note. Called when
+    /// Drop the transient DEK for the currently-open protected note. Called when
     /// the user navigates away from it.
     pub fn clear_active(&mut self) {
         self.active = None;
@@ -105,55 +105,116 @@ where
         Ok(notes.into_iter().map(blank_if_protected).collect())
     }
 
-    /// Reveal a single protected note by supplying its passphrase. Returns the
-    /// note with decrypted plaintext content and retains the derived key as the
-    /// active key so subsequent autosaves can re-seal. A non-protected note is
-    /// returned unchanged.
+    /// Protect a note. REQUIRES master recovery to be set up first. Generates a
+    /// per-note salt and a random DEK; seals the content with the DEK; wraps the
+    /// DEK under the note password; escrows the DEK to the master public key.
+    /// The note becomes the active note and is returned with plaintext content
+    /// so the UI can keep showing it.
+    pub fn protect_note(
+        &mut self,
+        id: &str,
+        note_pass: &str,
+    ) -> Result<Note, SecureNotesError> {
+        // Per-note protection cannot exist without the escrow target.
+        if !self.vault.is_initialized()? {
+            return Err(VaultError::NotInitialized.into());
+        }
+
+        let note = self.notes.get_note(id)?;
+        let plaintext = note.content.clone();
+
+        let note_salt = self.vault.generate_salt();
+        let dek = self.vault.generate_dek()?;
+
+        let content = self.vault.seal_content(&dek, &plaintext)?;
+        let dek_by_pass = self.vault.wrap_dek_by_pass(&dek, note_pass, &note_salt)?;
+        let dek_escrow = self.vault.escrow_dek(&dek)?;
+
+        let payload = ProtectedPayload {
+            version: PAYLOAD_VERSION,
+            note_salt,
+            content,
+            dek_by_pass,
+            dek_escrow,
+        };
+
+        let mut updated = self.notes.set_protection(id, true, encode_payload(&payload))?;
+        updated.content = plaintext;
+        self.active = Some((id.to_string(), dek));
+        Ok(updated)
+    }
+
+    /// Reveal a protected note by supplying its OWN password. Unwraps the DEK
+    /// from `dek_by_pass`, decrypts the content, and holds the DEK as the active
+    /// key. A non-protected note is returned unchanged.
     pub fn reveal_note(
         &mut self,
         id: &str,
-        passphrase: &str,
+        note_pass: &str,
     ) -> Result<Note, SecureNotesError> {
         let mut note = self.notes.get_note(id)?;
         if !note.is_protected {
             return Ok(note);
         }
 
-        let key = self.vault.verify_key(passphrase)?;
-        let plaintext = self.vault.open_with(&key, &note.content)?;
+        let payload = decode_payload(&note.content)?;
+        let dek = self
+            .vault
+            .unwrap_dek_by_pass(&payload.dek_by_pass, note_pass, &payload.note_salt)?;
+        let plaintext = self.vault.open_content(&dek, &payload.content)?;
+
         note.content = plaintext;
-        self.active = Some((id.to_string(), key));
+        self.active = Some((id.to_string(), dek));
         Ok(note)
     }
 
-    /// Encrypt an existing note's content and mark it protected. The passphrase
-    /// is supplied at this moment. The note becomes the active note and is
-    /// returned with its plaintext content so the UI can keep showing it.
-    pub fn protect_note(
+    /// Recover a protected note whose password was forgotten, using the MASTER
+    /// passphrase. Decrypts the master private key, ECIES-decrypts the escrowed
+    /// DEK, decrypts the content, then UNPROTECTS the note: the plaintext is
+    /// stored back, the flag cleared, and the protected payload removed. This
+    /// removes the old note password.
+    pub fn recover_note(
         &mut self,
         id: &str,
-        passphrase: &str,
+        master_pass: &str,
     ) -> Result<Note, SecureNotesError> {
         let note = self.notes.get_note(id)?;
-        let key = self.vault.verify_key(passphrase)?;
-        let plaintext = note.content.clone();
-        let sealed = self.vault.seal_with(&key, &note.content)?;
-        let mut updated = self.notes.set_protection(id, true, sealed)?;
-        updated.content = plaintext;
-        self.active = Some((id.to_string(), key));
+        if !note.is_protected {
+            return Ok(note);
+        }
+
+        let payload = decode_payload(&note.content)?;
+        let private_key = self.vault.recover_private_key(master_pass)?;
+        let dek = self
+            .vault
+            .recover_dek_from_escrow(&private_key, &payload.dek_escrow)?;
+        let plaintext = self.vault.open_content(&dek, &payload.content)?;
+
+        let updated = self.notes.set_protection(id, false, plaintext)?;
+        if self.active_id() == Some(id) {
+            self.clear_active();
+        }
         Ok(updated)
     }
 
-    /// Decrypt a protected note back to plaintext and clear the flag. The
-    /// passphrase is supplied at this moment.
+    /// Decrypt a protected note back to plaintext and clear the flag, using the
+    /// note's OWN password.
     pub fn unprotect_note(
         &mut self,
         id: &str,
-        passphrase: &str,
+        note_pass: &str,
     ) -> Result<Note, SecureNotesError> {
         let note = self.notes.get_note(id)?;
-        let key = self.vault.verify_key(passphrase)?;
-        let plaintext = self.vault.open_with(&key, &note.content)?;
+        if !note.is_protected {
+            return Ok(note);
+        }
+
+        let payload = decode_payload(&note.content)?;
+        let dek = self
+            .vault
+            .unwrap_dek_by_pass(&payload.dek_by_pass, note_pass, &payload.note_salt)?;
+        let plaintext = self.vault.open_content(&dek, &payload.content)?;
+
         let updated = self.notes.set_protection(id, false, plaintext)?;
         if self.active_id() == Some(id) {
             self.clear_active();
@@ -172,18 +233,23 @@ where
     }
 
     /// Update a note. For a protected note the UI edits plaintext, so we re-seal
-    /// the new content before persisting — but ONLY when that exact note is the
-    /// active (currently-open) note, whose key we hold transiently. Otherwise
-    /// the operation is locked.
+    /// the new content with the held active DEK — but ONLY when that exact note
+    /// is the active (currently-open) note. The note_salt, dek_by_pass and
+    /// dek_escrow are preserved unchanged; only `content` is re-sealed with the
+    /// same DEK. Otherwise the operation is locked.
     pub fn update_note(&mut self, input: UpdateNoteInput) -> Result<Note, SecureNotesError> {
         let existing = self.notes.get_note(&input.id)?;
         if existing.is_protected {
-            let key = match &self.active {
-                Some((active_id, key)) if active_id == &input.id => key,
+            let dek = match &self.active {
+                Some((active_id, dek)) if active_id == &input.id => dek,
                 _ => return Err(VaultError::Locked.into()),
             };
+
+            let mut payload = decode_payload(&existing.content)?;
+            payload.content = self.vault.seal_content(dek, &input.content)?;
+
             let mut sealed_input = input;
-            sealed_input.content = self.vault.seal_with(key, &sealed_input.content)?;
+            sealed_input.content = encode_payload(&payload);
             let updated = self.notes.update_note(sealed_input)?;
             Ok(blank_if_protected(updated))
         } else {
@@ -207,8 +273,8 @@ where
     }
 
     /// Build a Markdown document for a note. Protected content has no plaintext
-    /// available without a passphrase under per-note auth, so a protected note
-    /// exports with blanked content (never plaintext or ciphertext).
+    /// available without a passphrase, so a protected note exports with blanked
+    /// content (never plaintext or ciphertext).
     pub fn export_markdown(&mut self, id: &str) -> Result<(String, String), SecureNotesError> {
         let note = self.notes.get_note(id)?;
         let content = if note.is_protected {
@@ -227,6 +293,16 @@ where
     fn active_id(&self) -> Option<&str> {
         self.active.as_ref().map(|(id, _)| id.as_str())
     }
+}
+
+/// Serialize a protected payload into the note's content string.
+fn encode_payload(payload: &ProtectedPayload) -> String {
+    serde_json::to_string(payload).expect("a protected payload always serializes")
+}
+
+/// Parse a stored content string into a protected payload.
+fn decode_payload(stored: &str) -> Result<ProtectedPayload, VaultError> {
+    serde_json::from_str(stored).map_err(|_| VaultError::CorruptPayload)
 }
 
 /// Blank a protected note's content before handing it to the UI, so neither
@@ -285,64 +361,110 @@ mod tests {
     }
 
     #[test]
-    fn vault_status_tracks_initialization_and_active_note() {
+    fn recovery_status_tracks_initialization_and_active_note() {
         let mut app = secure();
         assert_eq!(
-            app.vault_status().unwrap(),
-            VaultStatus {
-                initialized: false,
-                unlocked: false
+            app.recovery_status().unwrap(),
+            RecoveryStatus {
+                recovery_initialized: false,
+                active_note_open: false
             }
         );
 
-        app.create_vault("master-pass").unwrap();
-        // Creating the vault does not open a note.
+        app.set_up_recovery("master-pass").unwrap();
         assert_eq!(
-            app.vault_status().unwrap(),
-            VaultStatus {
-                initialized: true,
-                unlocked: false
+            app.recovery_status().unwrap(),
+            RecoveryStatus {
+                recovery_initialized: true,
+                active_note_open: false
             }
         );
 
         let note = app.create_note(input("Diary", "secret")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
-        // Protecting opens the note (active key held).
-        assert!(app.vault_status().unwrap().unlocked);
+        app.protect_note(&note.id, "1234").unwrap();
+        // Protecting opens the note (active DEK held).
+        assert!(app.recovery_status().unwrap().active_note_open);
 
         app.clear_active();
-        assert!(!app.vault_status().unwrap().unlocked);
+        assert!(!app.recovery_status().unwrap().active_note_open);
     }
 
     #[test]
-    fn reveal_note_returns_plaintext_with_correct_passphrase() {
+    fn protect_before_recovery_setup_errors() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        let note = app.create_note(input("Diary", "secret")).unwrap();
+
+        assert!(matches!(
+            app.protect_note(&note.id, "1234"),
+            Err(SecureNotesError::Vault(VaultError::NotInitialized))
+        ));
+    }
+
+    #[test]
+    fn protect_then_reveal_roundtrips() {
+        let mut app = secure();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "my secret thoughts")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
-        app.clear_active();
 
-        let revealed = app.reveal_note(&note.id, "master-pass").unwrap();
-        assert!(revealed.is_protected);
+        let protected = app.protect_note(&note.id, "1234").unwrap();
+        assert!(protected.is_protected);
+        // protect_note returns plaintext so the UI keeps showing the open note.
+        assert_eq!(protected.content, "my secret thoughts");
+
+        app.clear_active();
+        let revealed = app.reveal_note(&note.id, "1234").unwrap();
         assert_eq!(revealed.content, "my secret thoughts");
-        // Revealing makes it the active note.
-        assert!(app.vault_status().unwrap().unlocked);
+        assert!(app.recovery_status().unwrap().active_note_open);
     }
 
     #[test]
-    fn reveal_note_with_wrong_passphrase_errors() {
+    fn reveal_with_wrong_note_pass_errors() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "secret")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
         app.clear_active();
 
         assert!(matches!(
-            app.reveal_note(&note.id, "wrong-pass"),
+            app.reveal_note(&note.id, "wrong"),
             Err(SecureNotesError::Vault(VaultError::InvalidPassphrase))
         ));
-        // A failed reveal does not open the note.
-        assert!(!app.vault_status().unwrap().unlocked);
+        assert!(!app.recovery_status().unwrap().active_note_open);
+    }
+
+    #[test]
+    fn two_notes_use_independent_passwords() {
+        let mut app = secure();
+        app.set_up_recovery("master-pass").unwrap();
+
+        let note1 = app.create_note(input("One", "first body")).unwrap();
+        let note2 = app.create_note(input("Two", "second body")).unwrap();
+
+        app.protect_note(&note1.id, "1234").unwrap();
+        app.protect_note(&note2.id, "321").unwrap();
+        app.clear_active();
+
+        // Each opens with its own password.
+        assert_eq!(
+            app.reveal_note(&note1.id, "1234").unwrap().content,
+            "first body"
+        );
+        app.clear_active();
+        assert_eq!(
+            app.reveal_note(&note2.id, "321").unwrap().content,
+            "second body"
+        );
+        app.clear_active();
+
+        // And neither cross-unlocks the other.
+        assert!(matches!(
+            app.reveal_note(&note1.id, "321"),
+            Err(SecureNotesError::Vault(VaultError::InvalidPassphrase))
+        ));
+        assert!(matches!(
+            app.reveal_note(&note2.id, "1234"),
+            Err(SecureNotesError::Vault(VaultError::InvalidPassphrase))
+        ));
     }
 
     #[test]
@@ -353,18 +475,18 @@ mod tests {
         let revealed = app.reveal_note(&note.id, "irrelevant").unwrap();
         assert!(!revealed.is_protected);
         assert_eq!(revealed.content, "plain body");
-        assert!(!app.vault_status().unwrap().unlocked);
+        assert!(!app.recovery_status().unwrap().active_note_open);
     }
 
     #[test]
     fn list_notes_always_blanks_protected_content_even_when_active() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "plaintext-marker")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
 
         // The note is active right now, yet the list must still blank it.
-        assert!(app.vault_status().unwrap().unlocked);
+        assert!(app.recovery_status().unwrap().active_note_open);
         let listed = app.list_notes().unwrap();
         let protected = listed.iter().find(|n| n.id == note.id).unwrap();
         assert!(protected.is_protected);
@@ -374,12 +496,11 @@ mod tests {
     #[test]
     fn update_protected_note_requires_it_to_be_active() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "secret")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
         app.clear_active();
 
-        // No active key -> locked.
         assert!(matches!(
             app.update_note(update(&note.id, "new secret")),
             Err(SecureNotesError::Vault(VaultError::Locked))
@@ -389,61 +510,31 @@ mod tests {
     #[test]
     fn update_protected_note_reseals_when_active_and_roundtrips() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "secret")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
 
-        // Active note: update re-seals the new plaintext.
         let updated = app.update_note(update(&note.id, "new secret")).unwrap();
         assert!(updated.is_protected);
         assert_eq!(updated.content, ""); // blanked on the way out
 
-        // Revealing again returns the new content.
+        // Revealing again with the SAME note password returns the new content.
         app.clear_active();
-        let revealed = app.reveal_note(&note.id, "master-pass").unwrap();
+        let revealed = app.reveal_note(&note.id, "1234").unwrap();
         assert_eq!(revealed.content, "new secret");
-    }
-
-    #[test]
-    fn protect_then_reveal_roundtrips() {
-        let mut app = secure();
-        app.create_vault("master-pass").unwrap();
-        let note = app.create_note(input("Diary", "my secret thoughts")).unwrap();
-
-        let protected = app.protect_note(&note.id, "master-pass").unwrap();
-        assert!(protected.is_protected);
-        // protect_note returns plaintext so the UI keeps showing the open note.
-        assert_eq!(protected.content, "my secret thoughts");
-
-        app.clear_active();
-        let revealed = app.reveal_note(&note.id, "master-pass").unwrap();
-        assert_eq!(revealed.content, "my secret thoughts");
-    }
-
-    #[test]
-    fn protect_with_wrong_passphrase_errors() {
-        let mut app = secure();
-        app.create_vault("master-pass").unwrap();
-        let note = app.create_note(input("Diary", "secret")).unwrap();
-
-        assert!(matches!(
-            app.protect_note(&note.id, "wrong-pass"),
-            Err(SecureNotesError::Vault(VaultError::InvalidPassphrase))
-        ));
     }
 
     #[test]
     fn unprotect_restores_plaintext_and_clears_flag() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "secret")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
 
-        let restored = app.unprotect_note(&note.id, "master-pass").unwrap();
+        let restored = app.unprotect_note(&note.id, "1234").unwrap();
         assert!(!restored.is_protected);
         assert_eq!(restored.content, "secret");
-        // The active key for that note is cleared on unprotect.
-        assert!(!app.vault_status().unwrap().unlocked);
+        assert!(!app.recovery_status().unwrap().active_note_open);
 
         let listed = app.list_notes().unwrap();
         let plain = listed.iter().find(|n| n.id == note.id).unwrap();
@@ -452,16 +543,54 @@ mod tests {
     }
 
     #[test]
-    fn unprotect_with_wrong_passphrase_errors() {
+    fn unprotect_with_wrong_note_pass_errors() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Diary", "secret")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
 
         assert!(matches!(
-            app.unprotect_note(&note.id, "wrong-pass"),
+            app.unprotect_note(&note.id, "wrong"),
             Err(SecureNotesError::Vault(VaultError::InvalidPassphrase))
         ));
+    }
+
+    #[test]
+    fn recover_note_restores_content_with_master_and_removes_old_pass() {
+        let mut app = secure();
+        app.set_up_recovery("master-pass").unwrap();
+        let note = app.create_note(input("Diary", "forgotten secret")).unwrap();
+        app.protect_note(&note.id, "note-pass").unwrap();
+        app.clear_active();
+
+        // The note password is forgotten; the master passphrase recovers it.
+        let recovered = app.recover_note(&note.id, "master-pass").unwrap();
+        assert!(!recovered.is_protected);
+        assert_eq!(recovered.content, "forgotten secret");
+
+        // The note is now plain: the old password is gone and content is visible.
+        let listed = app.list_notes().unwrap();
+        let plain = listed.iter().find(|n| n.id == note.id).unwrap();
+        assert!(!plain.is_protected);
+        assert_eq!(plain.content, "forgotten secret");
+    }
+
+    #[test]
+    fn recover_note_with_wrong_master_pass_fails() {
+        let mut app = secure();
+        app.set_up_recovery("master-pass").unwrap();
+        let note = app.create_note(input("Diary", "secret")).unwrap();
+        app.protect_note(&note.id, "note-pass").unwrap();
+        app.clear_active();
+
+        assert!(matches!(
+            app.recover_note(&note.id, "wrong-master"),
+            Err(SecureNotesError::Vault(VaultError::InvalidPassphrase))
+        ));
+        // The note remains protected after a failed recovery.
+        let listed = app.list_notes().unwrap();
+        let still = listed.iter().find(|n| n.id == note.id).unwrap();
+        assert!(still.is_protected);
     }
 
     #[test]
@@ -478,12 +607,11 @@ mod tests {
     #[test]
     fn export_markdown_blanks_protected_content() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Secret", "classified intel")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
 
         let (_, document) = app.export_markdown(&note.id).unwrap();
-        // Never leak plaintext or ciphertext through export.
         assert!(!document.contains("classified intel"));
         assert!(document.starts_with("# Secret\n\n\n"));
     }
@@ -503,12 +631,11 @@ mod tests {
     #[test]
     fn search_never_matches_protected_content_even_when_active() {
         let mut app = secure();
-        app.create_vault("master-pass").unwrap();
+        app.set_up_recovery("master-pass").unwrap();
         let note = app.create_note(input("Journal", "uniquesecretword")).unwrap();
-        app.protect_note(&note.id, "master-pass").unwrap();
+        app.protect_note(&note.id, "1234").unwrap();
 
-        // Even with the note active, its protected content is never searchable.
-        assert!(app.vault_status().unwrap().unlocked);
+        assert!(app.recovery_status().unwrap().active_note_open);
         assert!(app.search_notes("uniquesecretword").unwrap().is_empty());
     }
 }

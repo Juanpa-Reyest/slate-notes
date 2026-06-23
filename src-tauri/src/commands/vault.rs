@@ -1,11 +1,13 @@
 use crate::domain::note::Note;
-use crate::domain::vault::VaultStatus;
+use crate::domain::vault::RecoveryStatus;
 use crate::state::AppState;
 use serde::Deserialize;
 use tauri::State;
 
 use super::{log_outcome, log_read_error};
 
+/// Input carrying a single passphrase (the master passphrase for recovery
+/// setup). The passphrase is never logged.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PassphraseInput {
@@ -13,7 +15,8 @@ pub struct PassphraseInput {
 }
 
 /// Input for a per-note protected operation: the note id plus the passphrase
-/// supplied at that moment. The passphrase is never logged.
+/// supplied at that moment (the note password, or the master passphrase for
+/// `recover_note`). The passphrase is never logged.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotePassphraseInput {
@@ -26,32 +29,32 @@ fn unavailable() -> String {
 }
 
 #[tauri::command]
-pub fn vault_status(state: State<'_, AppState>) -> Result<VaultStatus, String> {
+pub fn recovery_status(state: State<'_, AppState>) -> Result<RecoveryStatus, String> {
     let result = (|| {
         state
             .notes
             .lock()
             .map_err(|_| unavailable())?
-            .vault_status()
+            .recovery_status()
             .map_err(|error| error.to_string())
     })();
-    log_read_error("vault_status", result)
+    log_read_error("recovery_status", result)
 }
 
 #[tauri::command]
-pub fn create_vault(
+pub fn set_up_recovery(
     input: PassphraseInput,
     state: State<'_, AppState>,
-) -> Result<VaultStatus, String> {
-    // The passphrase is never logged — only whether vault creation succeeded.
+) -> Result<RecoveryStatus, String> {
+    // The passphrase is never logged — only whether recovery setup succeeded.
     let result = (|| {
         let mut guard = state.notes.lock().map_err(|_| unavailable())?;
         guard
-            .create_vault(&input.passphrase)
+            .set_up_recovery(&input.passphrase)
             .map_err(|error| error.to_string())?;
-        guard.vault_status().map_err(|error| error.to_string())
+        guard.recovery_status().map_err(|error| error.to_string())
     })();
-    log_outcome("create_vault", None, result)
+    log_outcome("set_up_recovery", None, result)
 }
 
 #[tauri::command]
@@ -70,11 +73,11 @@ pub fn reveal_note(input: NotePassphraseInput, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
-pub fn clear_active(state: State<'_, AppState>) -> Result<VaultStatus, String> {
+pub fn clear_active(state: State<'_, AppState>) -> Result<RecoveryStatus, String> {
     let result = (|| {
         let mut guard = state.notes.lock().map_err(|_| unavailable())?;
         guard.clear_active();
-        guard.vault_status().map_err(|error| error.to_string())
+        guard.recovery_status().map_err(|error| error.to_string())
     })();
     log_outcome("clear_active", None, result)
 }
@@ -110,4 +113,22 @@ pub fn unprotect_note(
             .map_err(|error| error.to_string())
     })();
     log_outcome("unprotect_note", Some(&id), result)
+}
+
+#[tauri::command]
+pub fn recover_note(
+    input: NotePassphraseInput,
+    state: State<'_, AppState>,
+) -> Result<Note, String> {
+    let id = input.id.clone();
+    // The master passphrase is never logged — only the note id and the outcome.
+    let result = (|| {
+        state
+            .notes
+            .lock()
+            .map_err(|_| unavailable())?
+            .recover_note(&input.id, &input.passphrase)
+            .map_err(|error| error.to_string())
+    })();
+    log_outcome("recover_note", Some(&id), result)
 }

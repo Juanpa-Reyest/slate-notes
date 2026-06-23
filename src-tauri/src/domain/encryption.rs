@@ -39,6 +39,18 @@ pub struct Sealed {
     pub ciphertext: Vec<u8>,
 }
 
+/// A payload sealed to an X25519 public key via ECIES. The ephemeral public key
+/// lets the holder of the matching X25519 private key reconstruct the shared
+/// secret and open `sealed`. Used to escrow a note's DEK to the master key so
+/// it can be recovered without the note password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EciesSealed {
+    /// The ephemeral X25519 public key (32 bytes) generated for this seal.
+    pub ephemeral_public: Vec<u8>,
+    /// The payload sealed under the key derived from the X25519 shared secret.
+    pub sealed: Sealed,
+}
+
 /// Failures at the crypto boundary. Deliberately coarse: we never reveal whether
 /// a decryption failure was caused by a wrong passphrase or by tampered data.
 #[derive(Debug, Clone, PartialEq, Eq)]

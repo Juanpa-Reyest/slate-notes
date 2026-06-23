@@ -1,12 +1,13 @@
-//! Persistence boundary for the vault record. The application depends on this
-//! trait, not on SQLite.
+//! Persistence boundary for the master-recovery record. The application depends
+//! on this trait, not on SQLite.
 
-use crate::domain::vault::{VaultError, VaultRecord};
+use crate::domain::vault::{MasterRecord, VaultError};
 
 pub trait VaultRepository {
-    /// Load the single vault record, or `None` if no vault exists yet.
-    fn load(&self) -> Result<Option<VaultRecord>, VaultError>;
+    /// Load the single master-recovery record, or `None` if recovery has not
+    /// been set up yet.
+    fn load(&self) -> Result<Option<MasterRecord>, VaultError>;
 
-    /// Create or replace the vault record.
-    fn save(&mut self, record: VaultRecord) -> Result<(), VaultError>;
+    /// Create or replace the master-recovery record.
+    fn save(&mut self, record: MasterRecord) -> Result<(), VaultError>;
 }
