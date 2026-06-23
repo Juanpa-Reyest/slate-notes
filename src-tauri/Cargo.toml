@@ -1,6 +1,6 @@
 [package]
 name = "ws-ai-note"
-version = "0.1.2"
+version = "0.2.0"
 description = "Local-first Linux Markdown notes launcher prototype."
 authors = ["WS AI Note contributors"]
 edition = "2021"
