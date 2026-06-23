@@ -1,15 +1,53 @@
 name: Release
 
-# This robot wakes up when you push a version tag like "v0.1.0".
-# It builds the app on three operating systems at once and attaches every
-# installer to a single draft Release.
+# Publishes a multi-OS release automatically whenever a version bump lands on
+# main: if package.json's version changed in the push, the app is built for
+# Linux, Windows and macOS and attached to a draft GitHub Release. Merges that
+# do NOT change the version (chores, fixes without a bump) are ignored, so main
+# never produces a phantom release. Can also be triggered manually.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch: {}
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect a version bump
+        id: detect
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run -> releasing v$VERSION"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git show HEAD~1:package.json > /tmp/prev-package.json 2>/dev/null; then
+            PREV="$(node -p "require('/tmp/prev-package.json').version")"
+          else
+            PREV="none"
+          fi
+          if [ "$VERSION" != "$PREV" ]; then
+            echo "Version changed $PREV -> $VERSION; releasing."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No version change ($VERSION); skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
     permissions:
       contents: write # allow the robot to create the GitHub Release
 
@@ -62,8 +100,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Slate ${{ github.ref_name }}"
+          tagName: v${{ needs.check-version.outputs.version }}
+          releaseName: "Slate v${{ needs.check-version.outputs.version }}"
           releaseBody: "Download the installer for your operating system below (Linux .deb/.rpm/.AppImage, Windows .msi/.exe, macOS .dmg)."
           releaseDraft: true
           prerelease: false
