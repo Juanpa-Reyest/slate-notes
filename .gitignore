@@ -13,3 +13,8 @@ vite.config.ts.timestamp-*
 # Rust / Tauri build artifacts
 /src-tauri/target
 /src-tauri/gen
+
+# Local-only: editor config, AI tooling, and docs (kept out of the repo)
+.opencode/
+.vscode/
+docs/
