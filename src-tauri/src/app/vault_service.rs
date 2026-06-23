@@ -1,294 +1,274 @@
-//! The vault use cases: create, unlock, lock, and (while unlocked) seal/open
-//! protected content. The derived key lives only inside the live session and is
-//! cleared on lock or after an inactivity timeout (auto-lock).
+//! Crypto/recovery use cases for the per-note protection model.
+//!
+//! This service is stateless: it never holds a derived key or a DEK. It owns
+//! the master-recovery record (the X25519 keypair) and exposes the primitive
+//! operations that [`super::secure_notes::SecureNotesService`] composes:
+//!
+//! * master-recovery setup and private-key recovery,
+//! * generating a fresh DEK,
+//! * sealing/opening note content with a DEK,
+//! * wrapping/unwrapping a DEK under a note-password-derived key,
+//! * escrowing/recovering a DEK to/from the master public key.
+//!
+//! All curve and symmetric crypto stays behind the `Cipher` port.
 
-use crate::domain::encryption::{DerivedKey, Sealed, PAYLOAD_VERSION};
-use crate::domain::vault::{VaultError, VaultRecord, VaultStatus, VAULT_SENTINEL};
+use crate::domain::encryption::{DerivedKey, EciesSealed, Sealed, PAYLOAD_VERSION};
+use crate::domain::vault::{MasterRecord, VaultError};
 use crate::ports::cipher::Cipher;
-use crate::ports::clock::Clock;
 use crate::ports::vault_repository::VaultRepository;
 
-/// A live unlocked session: the derived key plus the last time it was used.
-struct Session {
-    key: DerivedKey,
-    last_activity: u64,
-}
-
-pub struct VaultService<R, C, K> {
+pub struct VaultService<R, C> {
     repository: R,
     cipher: C,
-    clock: K,
-    auto_lock_secs: u64,
-    session: Option<Session>,
 }
 
-impl<R, C, K> VaultService<R, C, K>
+impl<R, C> VaultService<R, C>
 where
     R: VaultRepository,
     C: Cipher,
-    K: Clock,
 {
-    pub fn new(repository: R, cipher: C, clock: K, auto_lock_secs: u64) -> Self {
-        Self {
-            repository,
-            cipher,
-            clock,
-            auto_lock_secs,
-            session: None,
-        }
+    pub fn new(repository: R, cipher: C) -> Self {
+        Self { repository, cipher }
     }
 
-    /// Clear the session if it has been idle past the auto-lock window.
-    fn enforce_auto_lock(&mut self) {
-        if let Some(session) = &self.session {
-            let idle = self.clock.now_secs().saturating_sub(session.last_activity);
-            if idle >= self.auto_lock_secs {
-                self.session = None;
-            }
-        }
+    // --- Master recovery ---
+
+    /// Whether the master-recovery record has been set up.
+    pub fn is_initialized(&self) -> Result<bool, VaultError> {
+        Ok(self.repository.load()?.is_some())
     }
 
-    fn start_session(&mut self, key: DerivedKey) {
-        self.session = Some(Session {
-            key,
-            last_activity: self.clock.now_secs(),
-        });
-    }
-
-    pub fn status(&mut self) -> Result<VaultStatus, VaultError> {
-        self.enforce_auto_lock();
-        let initialized = self.repository.load()?.is_some();
-        Ok(VaultStatus {
-            initialized,
-            unlocked: self.session.is_some(),
-        })
-    }
-
-    /// Create the vault for the first time and leave it unlocked.
-    pub fn create(&mut self, passphrase: &str) -> Result<(), VaultError> {
+    /// Set up master recovery for the first time: generate an X25519 keypair,
+    /// seal the private key under a master-pass-derived key, and persist the
+    /// record. Errors if recovery already exists.
+    pub fn set_up_recovery(&mut self, master_pass: &str) -> Result<(), VaultError> {
         if self.repository.load()?.is_some() {
             return Err(VaultError::AlreadyExists);
         }
 
-        let salt = self.cipher.generate_salt();
-        let key = self.cipher.derive_key(passphrase, &salt)?;
-        let sentinel = self.cipher.encrypt(&key, VAULT_SENTINEL)?;
+        let (public_key, private_key) = self.cipher.generate_keypair()?;
 
-        self.repository.save(VaultRecord {
+        let kdf_salt = self.cipher.generate_salt();
+        let kek = self.cipher.derive_key(master_pass, &kdf_salt)?;
+        let private_key_sealed = self.cipher.encrypt(&kek, &private_key)?;
+
+        self.repository.save(MasterRecord {
             version: PAYLOAD_VERSION,
-            salt,
-            sentinel,
+            kdf_salt,
+            public_key,
+            private_key_sealed,
         })?;
 
-        self.start_session(key);
         Ok(())
     }
 
-    /// Unlock an existing vault by verifying the passphrase against the sentinel.
-    pub fn unlock(&mut self, passphrase: &str) -> Result<(), VaultError> {
+    /// The master X25519 public key, used to escrow note DEKs with no prompt.
+    /// `NotInitialized` if recovery has not been set up.
+    pub fn master_public_key(&self) -> Result<Vec<u8>, VaultError> {
         let record = self.repository.load()?.ok_or(VaultError::NotInitialized)?;
+        Ok(record.public_key)
+    }
 
-        let key = self.cipher.derive_key(passphrase, &record.salt)?;
-        let opened = self
+    /// Recover the master X25519 private key by decrypting it with the
+    /// master-pass-derived key. A wrong passphrase fails AEAD and surfaces as
+    /// `InvalidPassphrase`.
+    pub fn recover_private_key(&self, master_pass: &str) -> Result<Vec<u8>, VaultError> {
+        let record = self.repository.load()?.ok_or(VaultError::NotInitialized)?;
+        let kek = self.cipher.derive_key(master_pass, &record.kdf_salt)?;
+        self.cipher
+            .decrypt(&kek, &record.private_key_sealed)
+            .map_err(|_| VaultError::InvalidPassphrase)
+    }
+
+    // --- DEK primitives ---
+
+    /// Generate a fresh random Data Encryption Key.
+    pub fn generate_dek(&self) -> Result<DerivedKey, VaultError> {
+        Ok(self.cipher.generate_dek()?)
+    }
+
+    /// Seal note plaintext with a DEK.
+    pub fn seal_content(&self, dek: &DerivedKey, plaintext: &str) -> Result<Sealed, VaultError> {
+        Ok(self.cipher.encrypt(dek, plaintext.as_bytes())?)
+    }
+
+    /// Open sealed note content with a DEK back to plaintext.
+    pub fn open_content(&self, dek: &DerivedKey, sealed: &Sealed) -> Result<String, VaultError> {
+        let bytes = self
             .cipher
-            .decrypt(&key, &record.sentinel)
+            .decrypt(dek, sealed)
             .map_err(|_| VaultError::InvalidPassphrase)?;
-
-        if opened != VAULT_SENTINEL {
-            return Err(VaultError::InvalidPassphrase);
-        }
-
-        self.start_session(key);
-        Ok(())
+        String::from_utf8(bytes).map_err(|_| VaultError::CorruptPayload)
     }
 
-    /// Lock the vault, wiping the derived key from memory.
-    pub fn lock(&mut self) {
-        self.session = None;
+    /// Wrap a DEK under a key derived from the note password, returning the
+    /// sealed DEK and the note salt that was used.
+    pub fn wrap_dek_by_pass(
+        &self,
+        dek: &DerivedKey,
+        note_pass: &str,
+        note_salt: &[u8],
+    ) -> Result<Sealed, VaultError> {
+        let pass_key = self.cipher.derive_key(note_pass, note_salt)?;
+        Ok(self.cipher.encrypt(&pass_key, dek.bytes())?)
     }
 
-    /// Encrypt protected content. Requires an unlocked vault.
-    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, VaultError> {
-        self.enforce_auto_lock();
-        let now = self.clock.now_secs();
-        let session = self.session.as_mut().ok_or(VaultError::Locked)?;
-        let sealed = self.cipher.encrypt(&session.key, plaintext)?;
-        session.last_activity = now;
-        Ok(sealed)
-    }
-
-    /// Decrypt protected content. Requires an unlocked vault.
-    pub fn open(&mut self, sealed: &Sealed) -> Result<Vec<u8>, VaultError> {
-        self.enforce_auto_lock();
-        let now = self.clock.now_secs();
-        let session = self.session.as_mut().ok_or(VaultError::Locked)?;
-        let plaintext = self
+    /// Unwrap a DEK from `dek_by_pass` using the note password and salt. A wrong
+    /// note password fails AEAD and surfaces as `InvalidPassphrase`.
+    pub fn unwrap_dek_by_pass(
+        &self,
+        dek_by_pass: &Sealed,
+        note_pass: &str,
+        note_salt: &[u8],
+    ) -> Result<DerivedKey, VaultError> {
+        let pass_key = self.cipher.derive_key(note_pass, note_salt)?;
+        let bytes = self
             .cipher
-            .decrypt(&session.key, sealed)
+            .decrypt(&pass_key, dek_by_pass)
             .map_err(|_| VaultError::InvalidPassphrase)?;
-        session.last_activity = now;
-        Ok(plaintext)
+        to_dek(bytes)
     }
 
-    /// Encrypt plaintext note content into a single storable string. Unlocked only.
-    pub fn protect(&mut self, plaintext: &str) -> Result<String, VaultError> {
-        let sealed = self.seal(plaintext.as_bytes())?;
-        Ok(encode_sealed(&sealed))
+    /// Escrow a DEK to the master public key so it can be recovered without the
+    /// note password.
+    pub fn escrow_dek(&self, dek: &DerivedKey) -> Result<EciesSealed, VaultError> {
+        let public_key = self.master_public_key()?;
+        Ok(self.cipher.ecies_seal(&public_key, dek.bytes())?)
     }
 
-    /// Decrypt stored protected content back to plaintext. Unlocked only.
-    pub fn reveal(&mut self, stored: &str) -> Result<String, VaultError> {
-        let sealed = decode_sealed(stored).ok_or(VaultError::InvalidPassphrase)?;
-        let bytes = self.open(&sealed)?;
-        String::from_utf8(bytes).map_err(|_| VaultError::InvalidPassphrase)
+    /// Recover a DEK from its escrow using the master private key.
+    pub fn recover_dek_from_escrow(
+        &self,
+        private_key: &[u8],
+        escrow: &EciesSealed,
+    ) -> Result<DerivedKey, VaultError> {
+        let bytes = self
+            .cipher
+            .ecies_open(private_key, escrow)
+            .map_err(|_| VaultError::InvalidPassphrase)?;
+        to_dek(bytes)
+    }
+
+    /// A fresh per-note salt.
+    pub fn generate_salt(&self) -> Vec<u8> {
+        self.cipher.generate_salt()
     }
 }
 
-/// Serialize a sealed payload to a string for storage in the note content column.
-fn encode_sealed(sealed: &Sealed) -> String {
-    serde_json::to_string(sealed).expect("a sealed payload always serializes")
-}
-
-/// Parse a stored string back into a sealed payload (None if it is not one).
-fn decode_sealed(stored: &str) -> Option<Sealed> {
-    serde_json::from_str(stored).ok()
+/// Turn raw 32-byte DEK material back into a `DerivedKey`.
+fn to_dek(bytes: Vec<u8>) -> Result<DerivedKey, VaultError> {
+    if bytes.len() != 32 {
+        return Err(VaultError::CorruptPayload);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(DerivedKey::new(key))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
     use super::*;
     use crate::infra::memory_vault_repository::MemoryVaultRepository;
     use crate::infra::xchacha_cipher::XChaChaCipher;
 
-    /// A controllable clock for deterministic auto-lock tests.
-    #[derive(Clone)]
-    struct FakeClock(Rc<Cell<u64>>);
-
-    impl FakeClock {
-        fn new(start: u64) -> Self {
-            Self(Rc::new(Cell::new(start)))
-        }
-        fn advance(&self, secs: u64) {
-            self.0.set(self.0.get() + secs);
-        }
-    }
-
-    impl Clock for FakeClock {
-        fn now_secs(&self) -> u64 {
-            self.0.get()
-        }
-    }
-
-    fn service(clock: FakeClock, auto_lock_secs: u64) -> VaultService<MemoryVaultRepository, XChaChaCipher, FakeClock> {
-        VaultService::new(
-            MemoryVaultRepository::default(),
-            XChaChaCipher::new(),
-            clock,
-            auto_lock_secs,
-        )
+    fn service() -> VaultService<MemoryVaultRepository, XChaChaCipher> {
+        VaultService::new(MemoryVaultRepository::default(), XChaChaCipher::new())
     }
 
     #[test]
-    fn create_initializes_and_unlocks() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-
-        let status = vault.status().unwrap();
-        assert!(status.initialized);
-        assert!(status.unlocked);
+    fn is_initialized_reports_false_then_true() {
+        let mut vault = service();
+        assert!(!vault.is_initialized().unwrap());
+        vault.set_up_recovery("master-pass").unwrap();
+        assert!(vault.is_initialized().unwrap());
     }
 
     #[test]
-    fn create_twice_fails() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        assert_eq!(vault.create("master-pass"), Err(VaultError::AlreadyExists));
+    fn set_up_recovery_twice_fails() {
+        let mut vault = service();
+        vault.set_up_recovery("master-pass").unwrap();
+        assert_eq!(
+            vault.set_up_recovery("master-pass").err(),
+            Some(VaultError::AlreadyExists)
+        );
     }
 
     #[test]
-    fn unlock_with_correct_passphrase_succeeds() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-        assert!(!vault.status().unwrap().unlocked);
-
-        vault.unlock("master-pass").unwrap();
-        assert!(vault.status().unwrap().unlocked);
+    fn recover_private_key_with_correct_pass_succeeds() {
+        let mut vault = service();
+        vault.set_up_recovery("master-pass").unwrap();
+        let private = vault.recover_private_key("master-pass").unwrap();
+        assert_eq!(private.len(), 32);
     }
 
     #[test]
-    fn unlock_with_wrong_passphrase_fails_and_stays_locked() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-
-        assert_eq!(vault.unlock("wrong-pass"), Err(VaultError::InvalidPassphrase));
-        assert!(!vault.status().unwrap().unlocked);
+    fn recover_private_key_with_wrong_pass_fails() {
+        let mut vault = service();
+        vault.set_up_recovery("master-pass").unwrap();
+        assert_eq!(
+            vault.recover_private_key("wrong-pass").err(),
+            Some(VaultError::InvalidPassphrase)
+        );
     }
 
     #[test]
-    fn unlock_before_creation_reports_not_initialized() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        assert_eq!(vault.unlock("whatever"), Err(VaultError::NotInitialized));
+    fn recover_before_setup_reports_not_initialized() {
+        let vault = service();
+        assert_eq!(
+            vault.recover_private_key("whatever").err(),
+            Some(VaultError::NotInitialized)
+        );
     }
 
     #[test]
-    fn lock_clears_the_session() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-        assert!(!vault.status().unwrap().unlocked);
+    fn dek_seals_and_opens_content() {
+        let vault = service();
+        let dek = vault.generate_dek().unwrap();
+        let sealed = vault.seal_content(&dek, "secret body").unwrap();
+        assert_eq!(vault.open_content(&dek, &sealed).unwrap(), "secret body");
     }
 
     #[test]
-    fn auto_lock_relocks_after_inactivity() {
-        let clock = FakeClock::new(1000);
-        let mut vault = service(clock.clone(), 300);
-        vault.create("master-pass").unwrap();
-        assert!(vault.status().unwrap().unlocked);
+    fn wrap_then_unwrap_dek_by_pass_roundtrips() {
+        let vault = service();
+        let dek = vault.generate_dek().unwrap();
+        let salt = vault.generate_salt();
 
-        clock.advance(300);
-        assert!(!vault.status().unwrap().unlocked);
-        assert_eq!(vault.open(&dummy_sealed()), Err(VaultError::Locked));
+        let wrapped = vault.wrap_dek_by_pass(&dek, "1234", &salt).unwrap();
+        let unwrapped = vault.unwrap_dek_by_pass(&wrapped, "1234", &salt).unwrap();
+
+        // The unwrapped DEK opens content sealed by the original DEK.
+        let sealed = vault.seal_content(&dek, "body").unwrap();
+        assert_eq!(vault.open_content(&unwrapped, &sealed).unwrap(), "body");
     }
 
     #[test]
-    fn activity_keeps_the_session_alive() {
-        let clock = FakeClock::new(1000);
-        let mut vault = service(clock.clone(), 300);
-        vault.create("master-pass").unwrap();
+    fn unwrap_dek_with_wrong_pass_fails() {
+        let vault = service();
+        let dek = vault.generate_dek().unwrap();
+        let salt = vault.generate_salt();
+        let wrapped = vault.wrap_dek_by_pass(&dek, "1234", &salt).unwrap();
 
-        clock.advance(200);
-        let sealed = vault.seal(b"note body").unwrap(); // refreshes activity
-        clock.advance(200); // 200 since last activity, below 300
-        assert!(vault.status().unwrap().unlocked);
-        assert_eq!(vault.open(&sealed).unwrap(), b"note body");
+        assert_eq!(
+            vault.unwrap_dek_by_pass(&wrapped, "wrong", &salt).err(),
+            Some(VaultError::InvalidPassphrase)
+        );
     }
 
     #[test]
-    fn seal_then_open_roundtrips_while_unlocked() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
+    fn escrow_then_recover_dek_roundtrips() {
+        let mut vault = service();
+        vault.set_up_recovery("master-pass").unwrap();
+        let dek = vault.generate_dek().unwrap();
 
-        let sealed = vault.seal(b"top secret").unwrap();
-        assert_eq!(vault.open(&sealed).unwrap(), b"top secret");
-    }
+        let escrow = vault.escrow_dek(&dek).unwrap();
+        let private = vault.recover_private_key("master-pass").unwrap();
+        let recovered = vault.recover_dek_from_escrow(&private, &escrow).unwrap();
 
-    #[test]
-    fn seal_when_locked_fails() {
-        let mut vault = service(FakeClock::new(1000), 300);
-        vault.create("master-pass").unwrap();
-        vault.lock();
-        assert_eq!(vault.seal(b"secret"), Err(VaultError::Locked));
-    }
-
-    fn dummy_sealed() -> Sealed {
-        Sealed {
-            nonce: vec![0; 24],
-            ciphertext: vec![0; 32],
-        }
+        let sealed = vault.seal_content(&dek, "escrowed body").unwrap();
+        assert_eq!(
+            vault.open_content(&recovered, &sealed).unwrap(),
+            "escrowed body"
+        );
     }
 }

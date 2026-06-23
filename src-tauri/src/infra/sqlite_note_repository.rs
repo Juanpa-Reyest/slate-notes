@@ -258,6 +258,77 @@ mod tests {
         assert!(persisted.is_protected);
     }
 
+    fn unique_db_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "slate-persist-{}-{}.sqlite",
+            std::process::id(),
+            nonce
+        ))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn note_survives_close_and_reopen_on_disk() {
+        let path = unique_db_path();
+        cleanup(&path);
+
+        {
+            let mut repository =
+                SqliteNoteRepository::open(&path).expect("repository should open on disk");
+            repository
+                .insert(note("note-1", "Survives restart", "100"))
+                .expect("insert should succeed");
+        } // repository dropped here -> simulates closing the app
+
+        let reopened =
+            SqliteNoteRepository::open(&path).expect("repository should reopen on disk");
+        let found = reopened
+            .find("note-1")
+            .expect("find should succeed")
+            .expect("note must survive close and reopen");
+        assert_eq!(found.title, "Survives restart");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn note_survives_reopen_with_second_connection_alive_on_close() {
+        // Mirrors the real app: notes + vault repositories hold two connections
+        // to the same file. The notes connection is dropped while the second
+        // connection is still alive, so its close cannot run a full checkpoint.
+        let path = unique_db_path();
+        cleanup(&path);
+
+        let sidecar = Connection::open(&path).expect("sidecar connection should open");
+
+        {
+            let mut repository =
+                SqliteNoteRepository::open(&path).expect("repository should open on disk");
+            repository
+                .insert(note("note-1", "Survives restart", "100"))
+                .expect("insert should succeed");
+        } // notes connection dropped while `sidecar` is still open
+
+        let reopened =
+            SqliteNoteRepository::open(&path).expect("repository should reopen on disk");
+        let found = reopened
+            .find("note-1")
+            .expect("find should succeed")
+            .expect("note must survive close and reopen with a second connection alive");
+        assert_eq!(found.title, "Survives restart");
+
+        drop(sidecar);
+        cleanup(&path);
+    }
+
     #[test]
     fn list_orders_by_descending_updated_at() {
         let mut repository = repository();

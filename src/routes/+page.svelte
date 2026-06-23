@@ -9,16 +9,18 @@
     searchNotes,
     toggleFavorite,
     updateNote,
-    vaultStatus,
-    createVault,
-    unlockVault,
-    lockVault,
+    recoveryStatus,
+    setUpRecovery,
+    revealNote,
+    clearActive,
     protectNote,
     unprotectNote,
+    recoverNote,
     exportNote,
     type Note,
-    type VaultStatus,
+    type RecoveryStatus,
   } from "$lib/tauri-client/notes";
+  import { createAutosave, type SaveStatus } from "$lib/autosave";
 
   type CategoryNavItem = {
     id: string;
@@ -48,8 +50,8 @@
   ];
 
   const COLOR_OPTIONS: ColorOption[] = [
-    { value: "slate", label: "Slate", description: "Default" },
-    { value: "violet", label: "Violet", description: "Focus" },
+    { value: "slate", label: "Slate", description: "Predeterminado" },
+    { value: "violet", label: "Violet", description: "Enfoque" },
     { value: "amber", label: "Amber", description: "Idea" },
     { value: "emerald", label: "Emerald", description: "Personal" },
   ];
@@ -59,28 +61,41 @@
   let selectedCategory = $state("all");
   let searchQuery = $state("");
   let errorMessage = $state("");
-  let isSaving = $state(false);
+  let saveStatus = $state<SaveStatus>("idle");
+  let lastSavedAt = $state("");
   let isMarkdownEditing = $state(false);
   let isCategoryMenuOpen = $state(false);
   let isColorMenuOpen = $state(false);
   let searchInput = $state<HTMLInputElement | null>(null);
 
-  let vault = $state<VaultStatus>({ initialized: false, unlocked: false });
+  let recovery = $state<RecoveryStatus>({ recoveryInitialized: false, activeNoteOpen: false });
   let isVaultDialogOpen = $state(false);
-  let vaultMode = $state<"create" | "unlock">("unlock");
+  let vaultMode = $state<"setup-recovery" | "protect" | "unprotect" | "recover">("protect");
   let passphrase = $state("");
   let passphraseConfirm = $state("");
   let vaultError = $state("");
   let noticeMessage = $state("");
+  // The id of the note whose plaintext is currently shown (the active note).
+  let revealedNoteId = $state<string | null>(null);
+  // Passphrase typed into the inline reveal panel; cleared right after use.
+  let revealPassphrase = $state("");
+  // Remembers a protect/unprotect the user asked for; the vault dialog collects
+  // the passphrase and then completes the operation with it.
+  let pendingProtect = $state<{ id: string; protect: boolean } | null>(null);
+  // Remembers a recover operation the user triggered from the locked panel.
+  let pendingRecover = $state<{ id: string } | null>(null);
+  let recoverPassphrase = $state("");
 
   let sourceNotes = $derived(notes);
   let categoryItems = $derived(buildCategoryItems(sourceNotes));
   let visibleNotes = $derived(filterNotes(sourceNotes, selectedCategory, searchQuery));
   let previewHtml = $derived(selectedNote ? marked.parse(selectedNote.content) : "");
+  let isNoteLocked = $derived(!!selectedNote?.isProtected && revealedNoteId !== selectedNote?.id);
+  let saveLabel = $derived(formatSaveLabel(saveStatus, lastSavedAt));
 
   onMount(async () => {
     notes = await listNotes();
-    vault = await vaultStatus();
+    recovery = await recoveryStatus();
     selectedNote = notes.find((note) => !note.isArchived) ?? notes[0] ?? null;
     await tick();
     searchInput?.focus();
@@ -89,10 +104,10 @@
   function buildCategoryItems(noteList: Note[]): CategoryNavItem[] {
     const activeNotes = noteList.filter((note) => !note.isArchived);
     const baseItems: CategoryNavItem[] = [
-      { id: "all", label: "All Notes", count: noteList.length, tone: "neutral" },
-      { id: "favorites", label: "Favorites", count: noteList.filter((note) => note.isFavorite).length, tone: "gold" },
-      { id: "protected", label: "Protected", count: noteList.filter((note) => note.isProtected).length, tone: "violet" },
-      { id: "archived", label: "Archived", count: noteList.filter((note) => note.isArchived).length, tone: "muted" },
+      { id: "all", label: "Todas las notas", count: noteList.length, tone: "neutral" },
+      { id: "favorites", label: "Favoritas", count: noteList.filter((note) => note.isFavorite).length, tone: "gold" },
+      { id: "protected", label: "Protegidas", count: noteList.filter((note) => note.isProtected).length, tone: "violet" },
+      { id: "archived", label: "Archivadas", count: noteList.filter((note) => note.isArchived).length, tone: "muted" },
     ];
 
     const categoryCounts = activeNotes.reduce<Record<string, number>>((counts, note) => {
@@ -129,7 +144,7 @@
       .replace(/\s+/g, " ")
       .trim();
 
-    return cleaned || "No content yet. Enable Markdown edit to start writing.";
+    return cleaned || "Sin contenido. Activa la edición Markdown para comenzar.";
   }
 
   function isDefaultCategory(category: string) {
@@ -186,13 +201,23 @@
   }
 
   async function refresh(nextSelectedId = selectedNote?.id) {
+    const previous = selectedNote;
     const nextNotes = searchQuery.trim()
       ? await searchNotes(searchQuery)
       : await listNotes();
     notes = nextNotes;
 
     const nextVisibleNotes = filterNotes(nextNotes, selectedCategory, searchQuery);
-    selectedNote = nextVisibleNotes.find((note) => note.id === nextSelectedId) ?? nextVisibleNotes[0] ?? nextNotes[0] ?? null;
+    let next = nextVisibleNotes.find((note) => note.id === nextSelectedId) ?? nextVisibleNotes[0] ?? nextNotes[0] ?? null;
+
+    // The list returns protected notes blanked. If we are re-selecting the note
+    // that is currently revealed, keep its already-decrypted plaintext instead
+    // of the blanked list copy (otherwise its content would vanish from view).
+    if (next && previous && next.id === previous.id && revealedNoteId === next.id) {
+      next = { ...next, content: previous.content };
+    }
+
+    selectedNote = next;
   }
 
   async function handleSearch() {
@@ -201,6 +226,11 @@
 
   async function handleCreate() {
     await run(async () => {
+      // Leaving the current note flushes pending edits, drops the active key,
+      // and clears revealedNoteId so the previous note re-locks. Without this,
+      // a stale revealedNoteId makes the old note's list row show the NEW note's
+      // content (the active-note excerpt override leaking across notes).
+      await leaveActiveNote();
       const category = selectedCategory.startsWith("category:")
         ? selectedCategory.replace("category:", "")
         : "Inbox";
@@ -210,6 +240,11 @@
         content: "",
         category,
       });
+      // Optimistically show the new note right away so the category counts in the
+      // nav update instantly. Without this the count lags during the createNote →
+      // listNotes round-trip and can briefly flash a stale value. refresh() below
+      // then reconciles with the authoritative backend list.
+      notes = [created, ...notes];
       searchQuery = "";
       selectedCategory = categoryId(created.category);
       await refresh(created.id);
@@ -217,30 +252,79 @@
     });
   }
 
-  async function handleSave() {
-    if (!selectedNote) return;
+  async function persistSelectedNote() {
     const note = selectedNote;
+    if (!note) return;
+    // Never overwrite a protected note's encrypted content while it is locked.
+    // When it is the active (revealed) note, autosave is allowed: the backend
+    // re-seals with the active key.
+    if (note.isProtected && revealedNoteId !== note.id) return;
+    // A note with neither title nor content cannot be saved (the backend rejects
+    // empty notes). Skip quietly so an untouched note never raises a save error.
+    if (!note.title.trim() && !note.content.trim()) return;
 
-    isSaving = true;
-    await run(async () => {
-      const saved = await updateNote({
-        id: note.id,
-        title: note.title,
-        content: note.content,
-        category: note.category,
-        tags: note.tags,
-        color: note.color,
-      });
-      await refresh(saved.id);
-      isMarkdownEditing = false;
+    await updateNote({
+      id: note.id,
+      title: note.title,
+      content: note.content,
+      category: note.category,
+      tags: note.tags,
+      color: note.color,
     });
-    isSaving = false;
+  }
+
+  const autosave = createAutosave(persistSelectedNote, {
+    delayMs: 800,
+    onStatus: (status) => {
+      saveStatus = status;
+      if (status === "saved") {
+        lastSavedAt = formatClock();
+        errorMessage = "";
+      }
+      if (status === "error") errorMessage = "No se pudo guardar la nota.";
+    },
+  });
+
+  // Mark the current note dirty so autosave persists it after a short pause.
+  function scheduleAutosave() {
+    if (!selectedNote) return;
+    if (selectedNote.isProtected && revealedNoteId !== selectedNote.id) return;
+    // Don't arm autosave for an empty note (no title, no content): the backend
+    // rejects it and the UI would flash a "could not save" error for a note the
+    // user simply hasn't written yet.
+    if (!selectedNote.title.trim() && !selectedNote.content.trim()) return;
+    autosave.schedule();
+  }
+
+  // Explicit save (button / Ctrl+S) just flushes the pending autosave.
+  async function handleSave() {
+    await run(() => autosave.flush());
+  }
+
+  function formatClock() {
+    return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function formatSaveLabel(status: SaveStatus, savedAt: string): string {
+    switch (status) {
+      case "saving":
+        return "Guardando…";
+      case "pending":
+        return "Cambios sin guardar";
+      case "error":
+        return "Error al guardar";
+      case "saved":
+        return savedAt ? `Guardado ${savedAt}` : "Guardado";
+      default:
+        return "Guardado";
+    }
   }
 
   async function handleFavorite() {
     if (!selectedNote) return;
     const note = selectedNote;
     await run(async () => {
+      await autosave.flush();
       const updated = await toggleFavorite(note.id);
       await refresh(updated.id);
     });
@@ -250,6 +334,7 @@
     if (!selectedNote) return;
     const note = selectedNote;
     await run(async () => {
+      await autosave.flush();
       const updated = await archiveNote(note.id);
       await refresh(updated.id);
     });
@@ -259,13 +344,16 @@
     if (!selectedNote) return;
     const deletedId = selectedNote.id;
     await run(async () => {
+      autosave.cancel();
+      if (revealedNoteId === deletedId) revealedNoteId = null;
+      // The backend clears the active key on delete; no clearActive() needed.
       await deleteNote(deletedId);
       await refresh();
     });
   }
 
-  function openVaultDialog() {
-    vaultMode = vault.initialized ? "unlock" : "create";
+  function openVaultDialog(mode: "setup-recovery" | "protect" | "unprotect" | "recover") {
+    vaultMode = mode;
     passphrase = "";
     passphraseConfirm = "";
     vaultError = "";
@@ -277,56 +365,158 @@
     passphrase = "";
     passphraseConfirm = "";
     vaultError = "";
+    // Cancelling the dialog abandons any protect/recover intent that was waiting on it.
+    pendingProtect = null;
+    pendingRecover = null;
+    recoverPassphrase = "";
   }
 
   async function submitVault() {
     vaultError = "";
     if (!passphrase) {
-      vaultError = "Enter a passphrase.";
+      vaultError = "Ingresa una contraseña.";
       return;
     }
-    if (vaultMode === "create" && passphrase !== passphraseConfirm) {
-      vaultError = "The passphrases do not match.";
+    // Confirm required for setup-recovery and protect
+    if ((vaultMode === "setup-recovery" || vaultMode === "protect") && passphrase !== passphraseConfirm) {
+      vaultError = "Las contraseñas no coinciden.";
       return;
     }
 
+    // Snapshot the entered passphrase and intent BEFORE closeVaultDialog()
+    // clears the bound fields, then run the operation and drop the passphrase.
+    const enteredPassphrase = passphrase;
+    const intent = pendingProtect;
+    const recoverIntent = pendingRecover;
+    const mode = vaultMode;
+
     try {
-      vault =
-        vaultMode === "create"
-          ? await createVault(passphrase)
-          : await unlockVault(passphrase);
-      closeVaultDialog();
-      await refresh();
+      if (mode === "setup-recovery") {
+        recovery = await setUpRecovery(enteredPassphrase);
+        closeVaultDialog();
+        await refresh();
+        // After setup, proceed to protect the note that triggered this
+        if (intent) {
+          pendingProtect = { id: intent.id, protect: true };
+          openVaultDialog("protect");
+        }
+        return;
+      }
+
+      if (mode === "protect" && intent) {
+        closeVaultDialog();
+        await applyProtection(intent.id, true, enteredPassphrase);
+        return;
+      }
+
+      if (mode === "unprotect" && intent) {
+        closeVaultDialog();
+        await applyProtection(intent.id, false, enteredPassphrase);
+        return;
+      }
+
+      if (mode === "recover" && recoverIntent) {
+        closeVaultDialog();
+        await run(async () => {
+          await autosave.flush();
+          const updated = await recoverNote(recoverIntent.id, enteredPassphrase);
+          await refresh(updated.id);
+          revealedNoteId = null;
+          selectedNote = updated;
+          recovery = await recoveryStatus();
+          noticeMessage = "Nota recuperada. La protección fue eliminada.";
+        });
+        return;
+      }
     } catch (error) {
       vaultError = error instanceof Error ? error.message : String(error);
     }
   }
 
-  async function handleVaultButton() {
-    if (vault.unlocked) {
-      await run(async () => {
-        vault = await lockVault();
-        await refresh();
-      });
-    } else {
-      openVaultDialog();
+  // Enter inside the passphrase fields submits the vault dialog (same as clicking the button).
+  function handlePassphraseKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submitVault();
+    }
+  }
+
+  // Reveal flow: unlock the currently selected locked note with its passphrase.
+  async function handleReveal() {
+    const note = selectedNote;
+    if (!note) return;
+    const enteredPassphrase = revealPassphrase;
+    await run(async () => {
+      const revealed = await revealNote(note.id, enteredPassphrase);
+      selectedNote = revealed;
+      revealedNoteId = revealed.id;
+      recovery = await recoveryStatus();
+    });
+    // Never keep the passphrase around, regardless of success or failure.
+    revealPassphrase = "";
+  }
+
+  function handleRevealKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleReveal();
     }
   }
 
   async function handleToggleProtection() {
     if (!selectedNote) return;
     const note = selectedNote;
+    if (note.isProtected) return; // handled by separate lock/unprotect buttons
 
-    if (!vault.unlocked) {
-      openVaultDialog();
+    if (!recovery.recoveryInitialized) {
+      pendingProtect = { id: note.id, protect: true };
+      openVaultDialog("setup-recovery");
       return;
     }
 
+    pendingProtect = { id: note.id, protect: true };
+    openVaultDialog("protect");
+  }
+
+  async function handleLock() {
     await run(async () => {
-      const updated = note.isProtected
-        ? await unprotectNote(note.id)
-        : await protectNote(note.id);
+      await autosave.flush();
+      recovery = await clearActive();
+      revealedNoteId = null;
+      // Refresh to get the blanked version from the list
+      await refresh(selectedNote?.id);
+    });
+  }
+
+  async function handleUnprotect() {
+    if (!selectedNote) return;
+    const note = selectedNote;
+    pendingProtect = { id: note.id, protect: false };
+    openVaultDialog("unprotect");
+  }
+
+  async function handleRecover() {
+    if (!selectedNote) return;
+    pendingRecover = { id: selectedNote.id };
+    pendingProtect = null;
+    openVaultDialog("recover");
+  }
+
+  async function applyProtection(id: string, protect: boolean, enteredPassphrase: string) {
+    await run(async () => {
+      await autosave.flush();
+      const updated = protect
+        ? await protectNote(id, enteredPassphrase)
+        : await unprotectNote(id, enteredPassphrase);
+      // Refresh the list FIRST (it returns the protected note blanked), then
+      // override selectedNote with the plaintext `updated` so the just-protected
+      // note keeps showing its content instead of the blanked list copy.
       await refresh(updated.id);
+      // Protecting leaves the note active (revealed); unprotecting clears it.
+      revealedNoteId = protect ? updated.id : null;
+      selectedNote = updated;
+      recovery = await recoveryStatus();
+      noticeMessage = protect ? "Nota protegida 🔒" : "Protección eliminada";
     });
   }
 
@@ -334,9 +524,14 @@
     if (!selectedNote) return;
     noticeMessage = "";
     errorMessage = "";
+    // A protected note that is not revealed would export blank; guard it.
+    if (isNoteLocked) {
+      noticeMessage = "Desbloquea la nota antes de exportar.";
+      return;
+    }
     try {
       const where = await exportNote(selectedNote.id);
-      noticeMessage = `Exported to ${where}`;
+      noticeMessage = `Exportado a ${where}`;
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
     }
@@ -359,7 +554,19 @@
     }
   }
 
-  function selectCategory(categoryId: string) {
+  // Re-seal pending edits with the active key (flush) BEFORE dropping it
+  // (clearActive). Order matters: flush needs the active key to persist the
+  // revealed note's content.
+  async function leaveActiveNote() {
+    await autosave.flush();
+    if (recovery.activeNoteOpen) {
+      recovery = await clearActive();
+    }
+    revealedNoteId = null;
+  }
+
+  async function selectCategory(categoryId: string) {
+    await leaveActiveNote();
     selectedCategory = categoryId;
     const nextVisibleNotes = filterNotes(notes, categoryId, searchQuery);
     selectedNote = nextVisibleNotes[0] ?? null;
@@ -368,7 +575,9 @@
     isColorMenuOpen = false;
   }
 
-  function selectNote(note: Note) {
+  async function selectNote(note: Note) {
+    if (note.id === selectedNote?.id) return;
+    await leaveActiveNote();
     selectedNote = note;
     isMarkdownEditing = false;
     isCategoryMenuOpen = false;
@@ -381,6 +590,7 @@
     selectedNote.category = category;
     selectedCategory = categoryId(category);
     isCategoryMenuOpen = false;
+    scheduleAutosave();
   }
 
   function setNoteColor(color: string) {
@@ -388,6 +598,7 @@
 
     selectedNote.color = color;
     isColorMenuOpen = false;
+    scheduleAutosave();
   }
 
   function toggleCategoryMenu() {
@@ -404,8 +615,8 @@
     const labels: Record<string, string> = {
       amber: "Idea",
       emerald: "Personal",
-      slate: "Default",
-      violet: "Focus",
+      slate: "Predeterminado",
+      violet: "Enfoque",
     };
 
     return labels[color] ?? color;
@@ -416,7 +627,7 @@
   <title>Slate</title>
 </svelte:head>
 
-<svelte:window onkeydown={handleShellKeydown} />
+<svelte:window onkeydown={handleShellKeydown} onblur={() => autosave.flush()} />
 
 {#snippet btnIcon(name: string)}
   <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -453,7 +664,7 @@
 
 <main class="screen">
   <section class="app-shell" aria-label="WS AI Note launcher">
-    <aside class="sidebar" aria-label="Notes navigation">
+    <aside class="sidebar" aria-label="Navegación de notas">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-width="2.2">
@@ -476,23 +687,13 @@
             bind:this={searchInput}
             bind:value={searchQuery}
             oninput={handleSearch}
-            placeholder="Search notes…"
-            aria-label="Search notes"
+            placeholder="Buscar notas…"
+            aria-label="Buscar notas"
           />
           <kbd>Ctrl K</kbd>
         </div>
 
-        <button class="new-button" type="button" onclick={handleCreate}>{@render btnIcon("plus")}<span>New note</span></button>
-
-        <button class="vault-toggle" type="button" onclick={handleVaultButton}>
-          {#if vault.unlocked}
-            {@render btnIcon("unlock")}<span>Lock vault</span>
-          {:else if vault.initialized}
-            {@render btnIcon("lock")}<span>Unlock vault</span>
-          {:else}
-            {@render btnIcon("lock")}<span>Set up vault</span>
-          {/if}
-        </button>
+        <button class="new-button" type="button" onclick={handleCreate}>{@render btnIcon("plus")}<span>Nueva nota</span></button>
       </div>
 
       {#if errorMessage}
@@ -503,7 +704,7 @@
         <p class="notice" role="status">{noticeMessage}</p>
       {/if}
 
-      <nav class="category-nav" aria-label="Categories">
+      <nav class="category-nav" aria-label="Categorías">
         {#each categoryItems as item}
           <button
             class:active={selectedCategory === item.id}
@@ -518,13 +719,13 @@
         {/each}
       </nav>
 
-      <section class="notes-section" aria-label="Notes list">
+      <section class="notes-section" aria-label="Lista de notas">
         <div class="notes-meta">
           <strong>{visibleNotes.length} notes</strong>
-          <span>{categoryItems.find((item) => item.id === selectedCategory)?.label ?? "All Notes"}</span>
+          <span>{categoryItems.find((item) => item.id === selectedCategory)?.label ?? "Todas las notas"}</span>
         </div>
 
-        <div class="notes-list" aria-label="Filtered notes">
+        <div class="notes-list" aria-label="Notas filtradas">
           {#if visibleNotes.length}
             {#each visibleNotes as note}
               <button
@@ -539,14 +740,14 @@
                     <strong>{note.title || "Untitled note"}</strong>
                     <small>{note.isProtected ? "🔒 " : ""}{normalizedCategory(note.category)}</small>
                   </span>
-                  <span class="note-excerpt">{noteExcerpt(note)}</span>
+                  <span class="note-excerpt">{noteExcerpt(note.id === revealedNoteId && note.id === selectedNote?.id && selectedNote ? selectedNote : note)}</span>
                 </span>
               </button>
             {/each}
           {:else}
             <div class="empty-list">
-              <strong>No notes here</strong>
-              <p>Create one in this category or clear the search.</p>
+              <strong>Sin notas aquí</strong>
+              <p>Crea una en esta categoría o limpia la búsqueda.</p>
             </div>
           {/if}
         </div>
@@ -555,33 +756,66 @@
       <footer class="signature">juanpa reyest <span aria-hidden="true">|</span> development engineer</footer>
     </aside>
 
-    <section class="content-panel" aria-label="Selected note content">
+    <section class="content-panel" aria-label="Contenido de la nota seleccionada">
       {#if selectedNote}
         <header class="content-header">
           <div class="title-stack">
-            <label for="note-title">Note title</label>
-            <input id="note-title" bind:value={selectedNote.title} aria-label="Note title" />
+            <label for="note-title">Título de la nota</label>
+            <input
+              id="note-title"
+              bind:value={selectedNote.title}
+              oninput={scheduleAutosave}
+              onblur={() => autosave.flush()}
+              disabled={isNoteLocked}
+              aria-label="Título de la nota"
+            />
           </div>
 
-          <div class="actions" aria-label="Note actions">
-            <button type="button" onclick={handleFavorite}>{@render btnIcon("star")}<span>{selectedNote.isFavorite ? "Starred" : "Star"}</span></button>
-            <button type="button" onclick={handleArchive}>{@render btnIcon("archive")}<span>{selectedNote.isArchived ? "Restore" : "Archive"}</span></button>
-            <button type="button" onclick={handleToggleProtection}>{@render btnIcon(selectedNote.isProtected ? "unlock" : "lock")}<span>{selectedNote.isProtected ? "Unprotect" : "Protect"}</span></button>
-            <button type="button" onclick={handleExport}>{@render btnIcon("download")}<span>Export</span></button>
-            <button class="danger" type="button" onclick={handleDelete}>{@render btnIcon("trash")}<span>Delete</span></button>
-            <button class="save" type="button" onclick={handleSave}>{@render btnIcon("check")}<span>{isSaving ? "Saving" : "Save"}</span></button>
+          <div class="actions" aria-label="Acciones de la nota">
+            <button
+              class:on-star={selectedNote.isFavorite}
+              type="button"
+              aria-pressed={selectedNote.isFavorite}
+              title={selectedNote.isFavorite ? "Quitar de favoritas" : "Agregar a favoritas"}
+              onclick={handleFavorite}
+            >{@render btnIcon("star")}<span>{selectedNote.isFavorite ? "Destacada" : "Destacar"}</span></button>
+            <button
+              class:on-archive={selectedNote.isArchived}
+              type="button"
+              aria-pressed={selectedNote.isArchived}
+              title={selectedNote.isArchived ? "Restaurar nota" : "Archivar"}
+              onclick={handleArchive}
+            >{@render btnIcon("archive")}<span>{selectedNote.isArchived ? "Restaurar" : "Archivar"}</span></button>
+            {#if selectedNote.isProtected}
+              {#if !isNoteLocked}
+                <button type="button" title="Bloquear esta nota" onclick={handleLock}>
+                  {@render btnIcon("lock")}<span>Bloquear</span>
+                </button>
+                <button class:on-protect={true} type="button" title="Eliminar protección de esta nota" onclick={handleUnprotect}>
+                  {@render btnIcon("unlock")}<span>Quitar protección</span>
+                </button>
+              {/if}
+            {:else}
+              <button type="button" title="Proteger esta nota" onclick={handleToggleProtection}>
+                {@render btnIcon("lock")}<span>Proteger</span>
+              </button>
+            {/if}
+            <button type="button" title="Exportar nota como archivo Markdown" onclick={handleExport}>{@render btnIcon("download")}<span>Exportar</span></button>
+            <button class="danger" type="button" title="Eliminar esta nota definitivamente" onclick={handleDelete}>{@render btnIcon("trash")}<span>Eliminar</span></button>
+            <button class={["save", "save-status", saveStatus]} type="button" onclick={handleSave} title="Guardar ahora (Ctrl+S)">{@render btnIcon("check")}<span>{saveLabel}</span></button>
           </div>
         </header>
 
-        <div class="meta-strip" aria-label="Note metadata">
+        <div class="meta-strip" aria-label="Metadatos de la nota">
           <div class="field-group">
-            <span class="field-label">Category</span>
+            <span class="field-label">Categoría</span>
             <div class="custom-menu">
               <button
                 class="custom-trigger"
                 type="button"
                 aria-haspopup="listbox"
                 aria-expanded={isCategoryMenuOpen}
+                disabled={isNoteLocked}
                 onclick={toggleCategoryMenu}
               >
                 <span class={["category-dot", categoryOption(selectedNote.category).tone]} aria-hidden="true"></span>
@@ -590,7 +824,7 @@
               </button>
 
               {#if isCategoryMenuOpen}
-                <div class="menu-popover" role="listbox" aria-label="Default categories">
+                <div class="menu-popover" role="listbox" aria-label="Categorías predeterminadas">
                   {#each DEFAULT_CATEGORIES as option}
                     <button
                       class:active={normalizedCategory(selectedNote?.category ?? "Inbox") === option.label}
@@ -616,6 +850,7 @@
                 type="button"
                 aria-haspopup="listbox"
                 aria-expanded={isColorMenuOpen}
+                disabled={isNoteLocked}
                 onclick={toggleColorMenu}
               >
                 <span class={["color-swatch", selectedNote.color]} aria-hidden="true"></span>
@@ -624,7 +859,7 @@
               </button>
 
               {#if isColorMenuOpen}
-                <div class="menu-popover color-popover" role="listbox" aria-label="Note colors">
+                <div class="menu-popover color-popover" role="listbox" aria-label="Colores de nota">
                   {#each COLOR_OPTIONS as option}
                     <button
                       class:active={selectedNote?.color === option.value}
@@ -645,37 +880,61 @@
             </div>
           </div>
 
-          <span class={["status-chip", selectedNote.isProtected ? "locked" : "open"]}>
-            {selectedNote.isProtected ? "Protected placeholder" : "Open note"}
+          <span class={["status-chip", isNoteLocked ? "locked" : "open"]}>
+            {#if selectedNote.isProtected}
+              {isNoteLocked ? "🔒 Bloqueada" : "🔓 Protegida"}
+            {:else}
+              Nota abierta
+            {/if}
           </span>
 
           <span class="status-chip">{colorLabel(selectedNote.color)}</span>
         </div>
 
-        {#if selectedNote.isProtected && !vault.unlocked}
+        {#if isNoteLocked}
           <div class="locked-panel">
             <span class="locked-icon" aria-hidden="true">🔒</span>
-            <h2>This note is protected</h2>
-            <p>Unlock the vault to read and edit its content.</p>
-            <button class="save" type="button" onclick={openVaultDialog}>Unlock vault</button>
+            <h2>Esta nota está protegida</h2>
+            <p>Ingresa la contraseña de esta nota para leer y editar su contenido.</p>
+            <div class="reveal-form">
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                type="password"
+                autocomplete="off"
+                placeholder="Contraseña de la nota"
+                aria-label="Contraseña de la nota"
+                bind:value={revealPassphrase}
+                onkeydown={handleRevealKeydown}
+              />
+              <button class="save" type="button" onclick={handleReveal}>Desbloquear</button>
+            </div>
+            <button class="recover-link" type="button" onclick={handleRecover}>
+              ¿Olvidaste la contraseña? Recuperar
+            </button>
           </div>
         {:else}
         <div class="editor-layout" class:preview-only={!isMarkdownEditing}>
           {#if isMarkdownEditing}
-            <section class="editor-pane" aria-label="Markdown source editor">
+            <section class="editor-pane" aria-label="Editor de texto Markdown">
               <div class="pane-label">
-                <span>Markdown edit</span>
+                <span>Edición Markdown</span>
                 <kbd>Ctrl S</kbd>
               </div>
-              <textarea bind:value={selectedNote.content} aria-label="Markdown editor" spellcheck="false"></textarea>
+              <textarea
+                bind:value={selectedNote.content}
+                oninput={scheduleAutosave}
+                onblur={() => autosave.flush()}
+                aria-label="Editor Markdown"
+                spellcheck="false"
+              ></textarea>
             </section>
           {/if}
 
-          <section class="preview-pane" aria-label="Markdown preview">
+          <section class="preview-pane" aria-label="Vista previa Markdown">
             <div class="pane-label">
-              <span>Preview</span>
+              <span>Vista previa</span>
               <button class="edit-markdown-button" type="button" onclick={() => (isMarkdownEditing = !isMarkdownEditing)}>
-                {@render btnIcon("edit")}<span>{isMarkdownEditing ? "Hide editor" : "Edit Markdown"}</span>
+                {@render btnIcon("edit")}<span>{isMarkdownEditing ? "Ocultar editor" : "Editar Markdown"}</span>
               </button>
             </div>
             <article class="preview">
@@ -694,31 +953,45 @@
               <line x1="7" y1="16.8" x2="11.6" y2="16.8" style="stroke: var(--text)" />
             </svg>
           </span>
-          <h1>No note selected</h1>
-          <p>Choose a category, pick a note, or create a new one.</p>
-          <button class="save" type="button" onclick={handleCreate}>Create note</button>
+          <h1>Ninguna nota seleccionada</h1>
+          <p>Elige una categoría, selecciona una nota o crea una nueva.</p>
+          <button class="save" type="button" onclick={handleCreate}>Crear nota</button>
         </div>
       {/if}
     </section>
   </section>
 
   {#if isVaultDialogOpen}
-    <div class="vault-overlay" role="dialog" aria-modal="true" aria-label="Vault passphrase">
+    <div class="vault-overlay" role="dialog" aria-modal="true" aria-label="Contraseña de nota">
       <div class="vault-dialog">
-        <h2>{vaultMode === "create" ? "Set up your vault" : "Unlock your vault"}</h2>
-        <p>
-          {vaultMode === "create"
-            ? "Choose a master passphrase. It protects all protected notes and is never stored. If you forget it, protected notes cannot be recovered."
-            : "Enter your master passphrase to read protected notes."}
-        </p>
-
-        <label for="vault-pass">Passphrase</label>
-        <!-- svelte-ignore a11y_autofocus -->
-        <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} />
-
-        {#if vaultMode === "create"}
-          <label for="vault-confirm">Confirm passphrase</label>
-          <input id="vault-confirm" type="password" autocomplete="off" bind:value={passphraseConfirm} />
+        {#if vaultMode === "setup-recovery"}
+          <h2>Configurar recuperación</h2>
+          <p>Elige una frase de recuperación maestra. Se usa para recuperar notas si olvidás su contraseña. Nunca se almacena — si la perdés, no hay forma de recuperar notas protegidas.</p>
+          <label for="vault-pass">Frase de recuperación</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} onkeydown={handlePassphraseKeydown} />
+          <label for="vault-confirm">Confirmar frase</label>
+          <input id="vault-confirm" type="password" autocomplete="off" bind:value={passphraseConfirm} onkeydown={handlePassphraseKeydown} />
+        {:else if vaultMode === "protect"}
+          <h2>Proteger nota</h2>
+          <p>Elige una contraseña para esta nota. Cada nota tiene su propia contraseña independiente.</p>
+          <label for="vault-pass">Contraseña de la nota</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} onkeydown={handlePassphraseKeydown} />
+          <label for="vault-confirm">Confirmar contraseña</label>
+          <input id="vault-confirm" type="password" autocomplete="off" bind:value={passphraseConfirm} onkeydown={handlePassphraseKeydown} />
+        {:else if vaultMode === "unprotect"}
+          <h2>Quitar protección</h2>
+          <p>Ingresa la contraseña de esta nota para eliminar su protección de forma permanente.</p>
+          <label for="vault-pass">Contraseña de la nota</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} onkeydown={handlePassphraseKeydown} />
+        {:else if vaultMode === "recover"}
+          <h2>Recuperar nota</h2>
+          <p>Ingresa tu frase de recuperación maestra para restaurar el contenido de esta nota y eliminar su protección.</p>
+          <label for="vault-pass">Frase de recuperación maestra</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input id="vault-pass" type="password" autocomplete="off" bind:value={passphrase} onkeydown={handlePassphraseKeydown} />
         {/if}
 
         {#if vaultError}
@@ -726,9 +999,13 @@
         {/if}
 
         <div class="vault-actions">
-          <button type="button" onclick={closeVaultDialog}>Cancel</button>
+          <button type="button" onclick={closeVaultDialog}>Cancelar</button>
           <button class="save" type="button" onclick={submitVault}>
-            {vaultMode === "create" ? "Create vault" : "Unlock"}
+            {#if vaultMode === "setup-recovery"}Configurar
+            {:else if vaultMode === "protect"}Proteger
+            {:else if vaultMode === "unprotect"}Quitar protección
+            {:else if vaultMode === "recover"}Recuperar
+            {/if}
           </button>
         </div>
       </div>
@@ -970,7 +1247,7 @@
 
   .sidebar-tools {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 1fr;
     gap: 8px;
   }
 
@@ -1222,6 +1499,52 @@
     border-color: var(--accent-line);
     color: var(--accent);
     background: var(--accent-bg);
+    min-width: 124px;
+    justify-content: center;
+  }
+
+  /* Autosave status cues so the user can tell saved from unsaved at a glance. */
+  .actions .save-status.pending {
+    color: var(--text-2);
+    border-color: var(--line-strong);
+    background: var(--btn);
+  }
+
+  .actions .save-status.saving {
+    color: var(--text-3);
+    border-color: var(--line-strong);
+    background: var(--btn);
+  }
+
+  .actions .save-status.error {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: var(--danger-bg);
+  }
+
+  /* Active-state cues so each toggle action reads at a glance. */
+  .actions .on-star {
+    color: #d8c08a;
+    border-color: rgba(216, 192, 138, 0.4);
+    background: rgba(216, 192, 138, 0.12);
+  }
+
+  .actions .on-protect {
+    color: #b9a3e3;
+    border-color: rgba(185, 163, 227, 0.4);
+    background: rgba(185, 163, 227, 0.12);
+  }
+
+  .actions .on-archive {
+    color: var(--text-2);
+    border-color: var(--line-strong);
+    background: var(--surface-active);
+  }
+
+  .title-stack input:disabled,
+  .custom-trigger:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   .meta-strip {
@@ -1520,25 +1843,26 @@
     padding: 0 14px;
   }
 
-  .vault-toggle {
-    grid-column: 1 / -1;
-    min-height: 34px;
-    display: inline-flex;
+  .reveal-form {
+    display: flex;
+    gap: 8px;
     align-items: center;
-    justify-content: center;
-    gap: 6px;
-    border: 1px solid var(--line-strong);
-    border-radius: 8px;
-    color: var(--text);
-    background: var(--btn);
-    font-size: 0.82rem;
-    font-weight: 500;
+    margin-top: 10px;
   }
 
-  .vault-toggle:hover {
-    border-color: var(--accent-line);
-    background: var(--btn-hover);
+  .reveal-form input {
+    min-height: 36px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
     color: var(--text);
+    background: var(--bg);
+    padding: 0 10px;
+    font-size: 0.9rem;
+  }
+
+  .reveal-form .save {
+    min-height: 36px;
+    padding: 0 14px;
   }
 
   .locked-panel {
@@ -1568,6 +1892,21 @@
     margin-top: 10px;
     min-height: 36px;
     padding: 0 14px;
+  }
+
+  .recover-link {
+    margin-top: 4px;
+    border: 0;
+    background: transparent;
+    color: var(--text-3);
+    font-size: 0.78rem;
+    text-decoration: underline;
+    cursor: pointer;
+    padding: 4px 8px;
+  }
+
+  .recover-link:hover {
+    color: var(--accent);
   }
 
   .vault-overlay {
