@@ -40,6 +40,9 @@ pub struct UpdateNoteInput {
 pub enum NoteError {
     EmptyNote,
     NotFound,
+    /// The storage backend failed. Only the SQLite repository constructs this
+    /// (RELEASE/test); a plain DEBUG `run()` uses the in-memory backend.
+    #[cfg_attr(all(debug_assertions, not(test)), allow(dead_code))]
     Storage(String),
 }
 
