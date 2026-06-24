@@ -2,9 +2,14 @@ name: Release
 
 # Publishes a multi-OS release automatically whenever a version bump lands on
 # main: if package.json's version changed in the push, the app is built for
-# Linux, Windows and macOS and attached to a draft GitHub Release. Merges that
-# do NOT change the version (chores, fixes without a bump) are ignored, so main
-# never produces a phantom release. Can also be triggered manually.
+# Linux, Windows and macOS, GitHub auto-generates the changelog from the merged
+# PRs since the last release, and the release is published. Merges that do NOT
+# change the version are ignored, so main never produces a phantom release.
+#
+# Author identity (B): every step authenticates with RELEASE_TOKEN if that
+# secret exists (a fine-grained PAT with Contents: read & write), so releases are
+# attributed to its owner instead of github-actions[bot]. If the secret is not
+# set, it falls back to the automatic GITHUB_TOKEN (released as the bot).
 on:
   push:
     branches: [main]
@@ -45,11 +50,11 @@ jobs:
             echo "should_release=false" >> "$GITHUB_OUTPUT"
           fi
 
-  build-and-release:
+  build:
     needs: check-version
     if: needs.check-version.outputs.should_release == 'true'
     permissions:
-      contents: write # allow the robot to create the GitHub Release
+      contents: write # allow the robot to create the draft Release
 
     strategy:
       fail-fast: false
@@ -95,14 +100,44 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build the app and publish the release
+      - name: Build the installers and upload them to a draft release
         uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # B: prefer the user's PAT so the release is attributed to them; fall
+          # back to the automatic token (github-actions[bot]) when it is absent.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
         with:
           tagName: v${{ needs.check-version.outputs.version }}
           releaseName: "Slate v${{ needs.check-version.outputs.version }}"
-          releaseBody: "Download the installer for your operating system below (Linux .deb/.rpm/.AppImage, Windows .msi/.exe, macOS .dmg)."
-          releaseDraft: true
+          releaseDraft: true # kept as a draft until the notes are generated below
           prerelease: false
           args: ${{ matrix.args }}
+
+  publish:
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # allow editing/publishing the release
+
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the changelog can diff against the last tag
+
+      - name: Generate the changelog and publish the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          # A: let GitHub auto-generate the notes from the PRs/commits merged
+          # since the previous release, then attach them and publish.
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="v$VERSION" \
+            -f target_commitish="${{ github.sha }}" \
+            --jq '.body' > /tmp/release-notes.md
+          gh release edit "v$VERSION" \
+            --notes-file /tmp/release-notes.md \
+            --draft=false \
+            --latest
