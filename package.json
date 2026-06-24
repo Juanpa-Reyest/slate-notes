@@ -1,6 +1,6 @@
 {
   "name": "ws-ai-note",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local-first Linux Markdown notes launcher prototype.",
   "type": "module",
   "scripts": {
